@@ -1,0 +1,14 @@
+{
+  "name": "opencodex-desktop",
+  "private": true,
+  "version": "2.35.0",
+  "description": "OpenCodex Desktop App shell",
+  "type": "module",
+  "scripts": {
+    "tauri": "tauri",
+    "validate:packaging": "bun scripts/validate-packaging.ts"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4"
+  }
+}

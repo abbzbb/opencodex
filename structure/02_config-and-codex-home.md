@@ -188,6 +188,17 @@ identity, and snapshot-guarded removal. `RuntimePortState.attestationSecret` rem
 owner-only state and is validated before a record is returned. `src/config.ts` re-exports the same
 symbols for compatibility, but new lifecycle-only callers import the process-state leaf directly.
 
+`src/config/start-lock.ts` derives `$OPENCODEX_HOME/ocx.start.lock` from the same directory. It is a
+sibling leaf of process-state, not a facade re-export: atomic mkdir/open, a random token-qualified
+owner record, live-PID protection, compare-before-release, bounded wait/timeout, and stale reclaim
+only when the owner PID is dead and the observed token/record still match. Empty or partially written
+publication is protected by a 30-second grace, then reclaimed only after repeated directory/file
+identity checks. Cleanup is `unlink` of the token-named owner file plus `rmdir` of an empty lock
+directory — never recursive delete.
+`withStartLock` is the production acquire/release wrapper. The default wait outlasts pinned-port
+reclaim (60s) plus bind/publish slack. Callers pass optional clock, sleep, and liveness hooks so
+tests can inject them without racing the wall clock.
+
 Both config and process-state writes use `src/config/atomic-write.ts`. The leaf preserves the shared
 process-wide temp sequence, symlink target resolution, real-home test guard, owner manifest,
 Windows ACL hardening, scrub-before-unlink failure path, and explicit residual-temp errors. A caller

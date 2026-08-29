@@ -861,8 +861,8 @@ describe("handleStart OCX_SERVICE exit guard (source-level)", () => {
   test("service.ts teardown kills surviving wrapper processes on stop", () => {
     const serviceSource = readFileSync(join(import.meta.dir, "../src/service.ts"), "utf8");
     expect(serviceSource).toMatch(/killWindowsServiceWrapperProcesses/);
-    const callSite = serviceSource.match(/stopServiceIfInstalled[\s\S]{0,1200}?killWindowsServiceWrapperProcesses\(\)/);
-    expect(callSite, "wrapper kill must run during stopServiceIfInstalled").not.toBeNull();
+    const callSite = serviceSource.match(/stopServiceForTransaction[\s\S]{0,2200}?killWindowsServiceWrapperProcesses\(\)/);
+    expect(callSite, "wrapper kill must run during stopServiceForTransaction").not.toBeNull();
   });
 
   test("wrapper kill matches the canonical paths of THIS installation, not bare filenames", () => {

@@ -50,6 +50,10 @@ devlog/**/security-advisory-draft*
 # Local development worktrees
 .worktrees/
 
+# Desktop Tauri build artifacts
+desktop/src-tauri/target/
+desktop/node_modules/
+
 # Test-generated artifacts
 # Trailing slash matched directories only, but the same tests also leave plain
 # files behind when a run dies mid-write -- and on Windows those can stay locked

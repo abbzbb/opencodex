@@ -1978,7 +1978,11 @@ export function startLaunchd(deps: {
       : "The job is not loaded. Run 'ocx service repair' to reload it."),
   );
 }
-function stopLaunchd(): void { try { sh(`launchctl unload "${plistPath()}"`); } catch { /* not loaded */ } }
+function stopLaunchd(): void {
+  if (!statusLaunchd()) return;
+  sh(`launchctl unload "${plistPath()}"`);
+  if (statusLaunchd()) throw new Error("launchd job is still loaded after stop");
+}
 function statusLaunchd(): string { try { return sh(`launchctl list | grep ${LABEL} || true`); } catch { return ""; } }
 function uninstallLaunchd(): void {
   const p = plistPath();
@@ -2451,7 +2455,8 @@ export function isWindowsSchedulerEndBenign(error: unknown): boolean {
 
 /**
  * End the scheduler task. "Already stopped" is success; other `/end` failures are
- * swallowed so callers can still run tracked-proxy + live-proxy cleanup.
+ * reported so lifecycle-sensitive callers can continue proxy cleanup without
+ * claiming the supervisor stopped successfully.
  *
  * Do not key a restart-window wait on `/end` failure: the #764 case is an `/end`
  * that *succeeds* while the wrapper survives and respawns. That verification lives
@@ -2462,6 +2467,7 @@ export function stopWindows(): void {
     schtasks(["/end", "/tn", TASK]);
   } catch (error) {
     if (isWindowsSchedulerEndBenign(error)) return;
+    throw error;
   }
 }
 function statusWindows(): string { try { return schtasks(["/query", "/tn", TASK]); } catch { return ""; } }
@@ -2658,7 +2664,7 @@ function startSystemd(): void {
   }
   sh(`systemctl --user start ${TASK}`);
 }
-function stopSystemd(): void { try { sh(`systemctl --user stop ${TASK}`); } catch { /* not running */ } }
+function stopSystemd(): void { sh(`systemctl --user stop ${TASK}`); }
 function statusSystemd(): string { try { return sh(`systemctl --user status ${TASK}`); } catch { return ""; } }
 function uninstallSystemd(): void {
   try { sh(`systemctl --user disable --now ${TASK}`); } catch { /* absent */ }
@@ -3010,36 +3016,72 @@ export async function installFreshWindowsSchedulerSafely(
   }
 }
 
-/**
- * If a service is installed, stop it so the process manager doesn't respawn after `ocx stop`.
- * Returns true if a service was found and stopped.
- */
-export function stopServiceIfInstalled(): boolean {
+export type ManagedServiceStopOutcome =
+  | { state: "absent"; canRespawn?: false }
+  | { state: "stopped"; canRespawn?: boolean }
+  | { state: "failed"; message: string; canRespawn?: boolean };
+
+/** Stop every installed manager and preserve the difference between absent and failed. */
+export function stopServiceForTransaction(): ManagedServiceStopOutcome {
   assertServiceEnvironmentMatchesInstall();
   if (process.platform === "darwin") {
     if (existsSync(plistPath())) {
-      try { stopLaunchd(); return true; } catch { return false; }
+      try {
+        stopLaunchd();
+        return { state: "stopped" };
+      } catch (error) {
+        return { state: "failed", message: error instanceof Error ? error.message : String(error) };
+      }
     }
   } else if (process.platform === "win32") {
-    // Query BOTH backends regardless of state: a failed switch or stale state can leave
-    // two managers installed, and either one would respawn the proxy after `ocx stop`.
-    let stopped = false;
-    try {
-      const q = schtasks(["/query", "/tn", TASK]);
-      if (q.includes(TASK)) { stopWindows(); stopped = true; }
-    } catch { /* task not found */ }
-    if (statusWinswRaw() !== "nonexistent") {
-      try { stopWinswService(); stopped = true; } catch { /* best-effort */ }
+    // Query both backends: a failed switch can leave two independent supervisors.
+    const failures: string[] = [];
+    let installed = false;
+    let schedulerInstalled = false;
+    const scheduler = probeWindowsSchedulerTask(TASK);
+    if (scheduler.status === "present") {
+      installed = true;
+      schedulerInstalled = true;
+      try { stopWindows(); } catch (error) {
+        failures.push(`Task Scheduler stop failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    } else if (scheduler.status === "unknown") {
+      failures.push(`Task Scheduler state is unknown: ${scheduler.detail}`);
     }
-    // `schtasks /end` ends the task instance but the cmd `:loop` wrapper survives and
-    // respawns its child seconds later (issue #764), resurrecting the proxy during a
-    // stop or a tray restart. Kill the launcher/wrapper processes outright.
-    killWindowsServiceWrapperProcesses();
-    if (stopped) return true;
+
+    const nativeStatus = statusWinswRaw();
+    if (nativeStatus !== "nonexistent") {
+      installed = true;
+      if (nativeStatus === "unknown") failures.push("WinSW service state is unknown");
+      else {
+        try { stopWinswService(); } catch (error) {
+          failures.push(`WinSW stop failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    }
+
+    // `/end` can leave the scheduler wrapper alive long enough to respawn its child.
+    try { killWindowsServiceWrapperProcesses(); } catch (error) {
+      failures.push(`service wrapper cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (failures.length > 0) {
+      return { state: "failed", message: failures.join("; "), canRespawn: schedulerInstalled };
+    }
+    if (installed) return { state: "stopped", canRespawn: schedulerInstalled };
   } else if (process.platform === "linux" && isSystemd() && existsSync(unitPath())) {
-    try { stopSystemd(); return true; } catch { return false; }
+    try {
+      stopSystemd();
+      return { state: "stopped" };
+    } catch (error) {
+      return { state: "failed", message: error instanceof Error ? error.message : String(error) };
+    }
   }
-  return false;
+  return { state: "absent" };
+}
+
+/** Legacy boolean facade for non-transactional rendering callers. */
+export function stopServiceIfInstalled(): boolean {
+  return stopServiceForTransaction().state === "stopped";
 }
 
 /** Delete install-state files; stale state would make `ocx update` "reinstall" a service that no longer exists. */
