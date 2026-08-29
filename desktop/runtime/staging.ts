@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import {
   chmodSync,
   closeSync,
+  constants as fsConstants,
   copyFileSync,
   fstatSync,
   fsyncSync,
@@ -39,6 +40,7 @@ import {
   posixSegments,
   readRuntimeManifestFile,
   realpathRoot,
+  serializeRuntimeManifest,
   stripUtf8Bom,
   validateRelativeRuntimePath,
   verifyRuntimeTree,
@@ -74,6 +76,7 @@ export type CurrentPointer = {
 };
 
 export type StagingHooks = {
+  beforeCopyFile?: (relPath: string, destPath: string) => void;
   afterCopyFile?: (relPath: string) => void;
   beforeRenameStage?: (tempDir: string) => void;
   beforePublish?: () => void;
@@ -145,6 +148,13 @@ export type ActivateRuntimeInput = StageRuntimeInput & {
 
 export type ActivateRuntimeSuccess = StageRuntimeSuccess & PublishCurrentSuccess;
 
+export type SyncPackagedRuntimeInput = Omit<StageRuntimeInput, "isVersionReferenced">;
+
+export type SyncPackagedRuntimeSuccess = StageRuntimeSuccess & {
+  pointer: CurrentPointer;
+  published: boolean;
+};
+
 export type ResolveRuntimeInput = {
   stableRoot: string;
   manifestId: string;
@@ -165,6 +175,10 @@ function pointersEqual(left: VersionPointer | null, right: VersionPointer | null
     left.target === right.target &&
     left.relPath === right.relPath
   );
+}
+
+function manifestsEqual(left: RuntimeManifest, right: RuntimeManifest): boolean {
+  return serializeRuntimeManifest(left) === serializeRuntimeManifest(right);
 }
 
 export function versionPointerFromManifest(manifest: RuntimeManifest): VersionPointer {
@@ -334,7 +348,7 @@ function ensureStableRoot(stableRoot: string): RuntimeStoreResult<{ root: string
   if (!exists.stat.isDirectory()) {
     return failStore("io_error", "stable root must be a directory");
   }
-  return okStore({ root: resolved });
+  return realpathRoot(resolved);
 }
 
 type FileIdentity = {
@@ -818,6 +832,37 @@ function ensureStableChildDir(root: string, name: string): RuntimeStoreResult<{ 
   return okStore({ absPath: created.absPath });
 }
 
+function cleanupAbandonedStaging(stagingRoot: string): RuntimeStoreResult<RuntimeUnit> {
+  let names: string[];
+  try {
+    names = readdirSync(stagingRoot);
+  } catch (error) {
+    return ioError(error);
+  }
+  for (const name of names) {
+    const match = /^(.*)-[a-f0-9]{16}$/.exec(name);
+    if (!match || !isRuntimeVersion(match[1])) {
+      return failStore("unexpected_file", "staging contains an unexpected entry");
+    }
+    const absPath = join(stagingRoot, name);
+    const child = fileExistsLstat(absPath);
+    if (!child.ok) {
+      return child;
+    }
+    if (!child.exists) {
+      continue;
+    }
+    if (!child.stat?.isDirectory() || child.stat.isSymbolicLink()) {
+      return failStore("symlink_forbidden", "staging entry must be a real directory");
+    }
+    const removed = removeTree(absPath);
+    if (!removed.ok) {
+      return removed;
+    }
+  }
+  return okUnit();
+}
+
 function assertStableChildDir(root: string, name: string): RuntimeStoreResult<{ absPath: string }> {
   const absPath = join(root, name);
   if (!isInsideRoot(root, absPath)) {
@@ -909,8 +954,16 @@ function copyAllowlist(input: {
       return dest;
     }
     try {
-      copyFileSync(source.absPath, dest.absPath);
+      input.hooks?.beforeCopyFile?.(entry.path, dest.absPath);
+      copyFileSync(source.absPath, dest.absPath, fsConstants.COPYFILE_EXCL);
     } catch (error) {
+      const collided = fileExistsLstat(dest.absPath);
+      if (collided.ok && collided.exists && collided.stat?.isSymbolicLink()) {
+        return failStore("symlink_forbidden", `symlink is not allowed: ${entry.path}`);
+      }
+      if (collided.ok && collided.exists) {
+        return failStore("unexpected_file", `destination already exists: ${entry.path}`);
+      }
       return ioError(error);
     }
     const destStat = fileExistsLstat(dest.absPath);
@@ -951,6 +1004,9 @@ function stageRuntimeLocked(input: StageRuntimeInput): RuntimeStoreResult<StageR
     return source;
   }
   const sourceRoot = source.root;
+  if (isInsideRoot(sourceRoot, stable.root) || isInsideRoot(stable.root, sourceRoot)) {
+    return failStore("path_escape", "source and stable runtime roots must not overlap");
+  }
   const enforceExecutableBit = input.enforceExecutableBit ?? defaultEnforceExecutableBit();
   const loaded = loadSourceManifest(sourceRoot, input.expectedTarget, input.manifest);
   if (!loaded.ok) {
@@ -969,6 +1025,10 @@ function stageRuntimeLocked(input: StageRuntimeInput): RuntimeStoreResult<StageR
   const stagingDir = ensureStableChildDir(stable.root, STABLE_STAGING_DIR);
   if (!stagingDir.ok) {
     return stagingDir;
+  }
+  const cleaned = cleanupAbandonedStaging(stagingDir.absPath);
+  if (!cleaned.ok) {
+    return cleaned;
   }
   const versionsDir = ensureStableChildDir(stable.root, STABLE_VERSIONS_DIR);
   if (!versionsDir.ok) {
@@ -991,7 +1051,7 @@ function stageRuntimeLocked(input: StageRuntimeInput): RuntimeStoreResult<StageR
       return failStore("symlink_forbidden", "version directory must not be a symlink");
     }
     const reused = verifyStagedVersion(finalAbs, staged, input.expectedTarget, enforceExecutableBit);
-    if (reused.ok) {
+    if (reused.ok && manifestsEqual(reused.manifest, manifest)) {
       return okStore({
         staged,
         absPath: finalAbs,
@@ -1401,6 +1461,67 @@ export function activateRuntime(input: ActivateRuntimeInput): RuntimeStoreResult
       pointer: published.pointer,
       pruned: published.pruned,
       retained: published.retained,
+    });
+  });
+}
+
+export function syncPackagedRuntime(
+  input: SyncPackagedRuntimeInput,
+): RuntimeStoreResult<SyncPackagedRuntimeSuccess> {
+  return withStoreLock<SyncPackagedRuntimeSuccess>(input.stableRoot, input.hooks, () => {
+    const stable = ensureStableRoot(input.stableRoot);
+    if (!stable.ok) {
+      return stable;
+    }
+    const retainEveryGeneration: VersionReferenceGuard = () => true;
+    const staged = stageRuntimeLocked({
+      ...input,
+      stableRoot: stable.root,
+      isVersionReferenced: retainEveryGeneration,
+    });
+    if (!staged.ok) {
+      return staged;
+    }
+
+    const observed = readCurrentPointer(stable.root);
+    if (!observed.ok) {
+      return observed;
+    }
+    if (!observed.pointer) {
+      const published = publishCurrentLocked({
+        stableRoot: stable.root,
+        staged: staged.staged,
+        expectedCurrent: null,
+        expectedTarget: input.expectedTarget,
+        enforceExecutableBit: input.enforceExecutableBit,
+        isVersionReferenced: retainEveryGeneration,
+        hooks: input.hooks,
+      });
+      if (!published.ok) {
+        return published;
+      }
+      return okStore({
+        ...staged,
+        pointer: published.pointer,
+        published: true,
+      });
+    }
+
+    const enforceExecutableBit = input.enforceExecutableBit ?? defaultEnforceExecutableBit();
+    const activeAbsPath = versionAbsPath(stable.root, observed.pointer.current.version);
+    const active = verifyStagedVersion(
+      activeAbsPath,
+      observed.pointer.current,
+      input.expectedTarget,
+      enforceExecutableBit,
+    );
+    if (!active.ok) {
+      return active;
+    }
+    return okStore({
+      ...staged,
+      pointer: observed.pointer,
+      published: false,
     });
   });
 }

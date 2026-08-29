@@ -47,6 +47,7 @@ const REQUIRED_RUNTIME_FILES = [
   "src/cli/index.ts",
   "gui/dist/index.html",
   "desktop/runtime/bootstrap.ts",
+  "desktop/runtime/install.ts",
 ] as const;
 const SIDECAR_STUB_MARKER = "OCX_DESKTOP_SIDECAR_STUB";
 const MIN_NATIVE_BINARY_BYTES = 4096;

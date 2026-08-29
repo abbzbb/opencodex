@@ -5,6 +5,7 @@ mod navigation;
 mod origin;
 mod packaging;
 mod protocol;
+mod staging;
 mod tray;
 
 use std::sync::{Arc, Mutex};
@@ -12,10 +13,12 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
 
-use crate::bridge::{default_bridge_spec, invoke_bridge, BridgeSpec};
+use crate::bridge::{bridge_spec_from_layout, default_bridge_spec, invoke_bridge, BridgeSpec};
 use crate::lifecycle::{quit_decision_from_stop, QuitDecision, QuitPhase};
 use crate::navigation::{init_plugin as navigation_plugin, set_allowed_origin, NavigationPolicy};
+use crate::packaging::layout_from_app;
 use crate::protocol::{bootstrap_request, status_request, stop_request, StopReason};
+use crate::staging::install_packaged_runtime;
 use crate::tray::{install_tray, show_main_window, TRAY_OPEN, TRAY_QUIT, TRAY_STATUS};
 
 pub struct AppState {
@@ -97,7 +100,28 @@ fn attach_dashboard(app: &AppHandle, origin: &str) -> Result<(), &'static str> {
 }
 
 fn bootstrap_and_attach(app: &AppHandle) {
-    let spec = match default_bridge_spec(app) {
+    let layout = match layout_from_app(app) {
+        Ok(layout) => layout,
+        Err(err) => {
+            set_shell_copy(
+                app,
+                "OpenCodex could not start",
+                "The packaged runtime layout is not available.",
+                &format!("{}: {}", err.code(), err.message()),
+            );
+            return;
+        }
+    };
+    if let Err(err) = install_packaged_runtime(&layout) {
+        set_shell_copy(
+            app,
+            "OpenCodex could not start",
+            "The packaged runtime could not be installed safely.",
+            &format!("{}: {}", err.code(), err.message()),
+        );
+        return;
+    }
+    let spec = match bridge_spec_from_layout(&layout) {
         Ok(spec) => spec,
         Err(err) => {
             set_shell_copy(
@@ -397,6 +421,17 @@ mod tests {
         assert!(!csp.contains("*"));
         assert!(!raw.contains("OCX_DESKTOP_BRIDGE_BIN"));
         assert!(!raw.contains("OCX_DESKTOP_RUNTIME_ROOT"));
+    }
+
+    #[test]
+    fn bootstrap_stages_before_resolving_the_stable_bridge() {
+        let source = include_str!("lib.rs");
+        let start = source.find("fn bootstrap_and_attach").unwrap();
+        let body = &source[start..source.find("fn refresh_status").unwrap()];
+        let stage = body.find("install_packaged_runtime(&layout)").unwrap();
+        let bridge = body.find("bridge_spec_from_layout(&layout)").unwrap();
+        let invoke = body.find("invoke_bridge(&spec").unwrap();
+        assert!(stage < bridge && bridge < invoke);
     }
 
     #[test]

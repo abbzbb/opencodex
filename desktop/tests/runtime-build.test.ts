@@ -116,6 +116,7 @@ function sourceFixture(): Fixture {
   writeRegular(join(root, "src/cli/index.ts"), "export {};\n");
   writeRegular(join(root, "gui/dist/index.html"), "<!doctype html>\n");
   writeRegular(join(root, "desktop/runtime/bootstrap.ts"), "export {};\n");
+  writeRegular(join(root, "desktop/runtime/install.ts"), "export {};\n");
   for (const asset of ["architecture.png", "banner.png", "claude-code-models.gif", "codex-app-picker.png"]) {
     writeRegular(join(root, "assets", asset), `fixture:${asset}\n`);
   }

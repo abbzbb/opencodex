@@ -36,6 +36,7 @@ import {
   rollbackCurrent,
   serializeStoreLockRecord,
   stageRuntime,
+  syncPackagedRuntime,
   verifyPublishedCurrent,
   type StoreLockRecord,
 } from "../runtime/staging";
@@ -667,6 +668,117 @@ describe("stable staging transaction", () => {
     if (live.ok) {
       expect(live.pointer).toBeNull();
     }
+  });
+
+  test("packaged sync publishes once, reuses the same version, and only stages a different version", () => {
+    const v1 = writePayload("2.35.0");
+    const v2 = writePayload("2.36.0");
+    const stableRoot = tempDir("ocx-runtime-packaged-sync-");
+
+    const first = syncPackagedRuntime({
+      sourceRoot: v1.root,
+      stableRoot,
+      expectedTarget: TARGET,
+      enforceExecutableBit: POSIX,
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(first.published).toBe(true);
+    expect(first.pointer.current.version).toBe("2.35.0");
+
+    const same = syncPackagedRuntime({
+      sourceRoot: v1.root,
+      stableRoot,
+      expectedTarget: TARGET,
+      enforceExecutableBit: POSIX,
+    });
+    expect(same.ok).toBe(true);
+    if (!same.ok) return;
+    expect(same.published).toBe(false);
+    expect(same.reused).toBe(true);
+    expect(same.pointer).toEqual(first.pointer);
+
+    const candidate = syncPackagedRuntime({
+      sourceRoot: v2.root,
+      stableRoot,
+      expectedTarget: TARGET,
+      enforceExecutableBit: POSIX,
+    });
+    expect(candidate.ok).toBe(true);
+    if (!candidate.ok) return;
+    expect(candidate.published).toBe(false);
+    expect(candidate.staged.version).toBe("2.36.0");
+    expect(candidate.pointer).toEqual(first.pointer);
+    expect(versions(stableRoot)).toEqual(["2.35.0", "2.36.0"]);
+  });
+
+  test("packaged sync refuses changed payload bytes under the active version", () => {
+    const original = writePayload("2.35.0");
+    const rebuilt = writePayload("2.35.0", { packageExtra: { build: "replacement" } });
+    const stableRoot = tempDir("ocx-runtime-packaged-same-version-drift-");
+
+    const first = syncPackagedRuntime({
+      sourceRoot: original.root,
+      stableRoot,
+      expectedTarget: TARGET,
+      enforceExecutableBit: POSIX,
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    const activePackage = join(stableRoot, "versions", "2.35.0", "package.json");
+    const before = readFileSync(activePackage, "utf8");
+    const changed = syncPackagedRuntime({
+      sourceRoot: rebuilt.root,
+      stableRoot,
+      expectedTarget: TARGET,
+      enforceExecutableBit: POSIX,
+    });
+    expect(changed.ok).toBe(false);
+    if (!changed.ok) expect(changed.code).toBe("version_in_use");
+    expect(readFileSync(activePackage, "utf8")).toBe(before);
+  });
+
+  test("the next locked stage removes an abandoned staging directory", () => {
+    const payload = writePayload("2.35.0");
+    const stableRoot = tempDir("ocx-runtime-abandoned-stage-");
+    const abandoned = join(stableRoot, STABLE_STAGING_DIR, "2.34.0-0123456789abcdef");
+    mkdirSync(abandoned, { recursive: true });
+    writeFileSync(join(abandoned, "partial"), "partial\n");
+
+    const staged = stageRuntime({
+      sourceRoot: payload.root,
+      stableRoot,
+      expectedTarget: TARGET,
+      enforceExecutableBit: POSIX,
+    });
+    expect(staged.ok).toBe(true);
+    expect(existsSync(abandoned)).toBe(false);
+  });
+
+  test("exclusive destination creation does not follow a planted file symlink", () => {
+    if (!POSIX) return;
+    const payload = writePayload("2.35.0");
+    const stableRoot = tempDir("ocx-runtime-copy-race-");
+    const outside = tempDir("ocx-runtime-copy-race-outside-");
+    const sentinel = join(outside, "sentinel");
+    writeFileSync(sentinel, "keep\n");
+
+    const result = stageRuntime({
+      sourceRoot: payload.root,
+      stableRoot,
+      expectedTarget: TARGET,
+      enforceExecutableBit: POSIX,
+      hooks: {
+        beforeCopyFile(relPath, destPath) {
+          if (relPath === "package.json") symlinkSync(sentinel, destPath);
+        },
+      },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe("symlink_forbidden");
+    expect(readFileSync(sentinel, "utf8")).toBe("keep\n");
+    expect(existsSync(join(stableRoot, CURRENT_POINTER_NAME))).toBe(false);
   });
 
   test("resolves a staged manifest id only after hash verification", () => {

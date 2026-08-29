@@ -26,6 +26,7 @@ const REQUIRED_RUNTIME_ENTRIES = [
   "package.json",
   "src/cli/index.ts",
   "desktop/runtime/bootstrap.ts",
+  "desktop/runtime/install.ts",
   "gui/dist/index.html",
 ] as const;
 

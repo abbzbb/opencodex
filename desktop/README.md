@@ -56,6 +56,16 @@ for rollback. Publication is compare-and-swap. A failed stage or publish must
 leave the previous current tree runnable. `staging/` and `versions/` must be
 real directories under the stable root; child symlinks are rejected.
 
+App bootstrap uses two separate closed process contracts. The packaged Bun first
+runs `desktop/runtime/install.ts` from Tauri's resolved resource directory. Its
+stdin contains only schema version, target triple, and the per-user stable root;
+its stdout is one bounded JSON object. It publishes only when `current.json` is
+missing, reuses an identical generation, and leaves a different current active
+while retaining the newly staged candidate. Rust then runs the existing v1
+`desktop/runtime/bootstrap.ts` bridge from the verified stable generation. The
+installer is not a v1 bridge operation and neither process accepts arbitrary
+CLI argv.
+
 `OPENCODEX_HOME` (`~/.opencodex`) stays the proxy config/credential/log home and
 is not migrated by Desktop. `$CODEX_HOME` journals are not touched.
 
@@ -91,12 +101,15 @@ work.
 - Target-native payload generation now produces a production dependency closure,
   target Bun/keyring packages, and a verified manifest. Debug builds may create a
   compile placeholder, while release builds require the real resource payload.
-- Stable staging is Bun-native and injectable (`expectedTarget`,
-  `enforceExecutableBit`), but App startup does not yet deploy the packaged Tauri
-  resource into the per-user stable root before bridge bootstrap.
+- App startup deploys the packaged Tauri resource into the per-user stable root
+  before bridge bootstrap. Debug builds skip that deployment only when
+  `OCX_DESKTOP_RUNTIME_ROOT` explicitly selects a development runtime tree;
+  release builds never honor the override.
 - `current.json` is an atomic file pointer. It is not a symlink contract.
-- One rollback generation is retained. Older trees are pruned only when no
-  current/previous pointer or `isVersionReferenced` guard names them.
+- Ownership-aware activation retains one rollback generation and prunes older
+  trees only when no current/previous pointer or `isVersionReferenced` guard
+  names them. First-start packaged sync retains every staged version until that
+  later activation transaction has service/PID ownership evidence.
 - Desktop does not read, cache, inject, or log dashboard sessions, management
   tokens, API keys, or OAuth tokens.
 - Automatic updates are not enabled. Signed installers and updater
@@ -111,7 +124,7 @@ None of the PLAN §9.2 install-time smokes have been run. Explicit gaps:
 | Gap | Platforms |
 |---|---|
 | Clean machine without Node/Bun/npm/global `ocx` | macOS arm64/x64, Windows x64, Linux x64 `.deb` |
-| Packaged resource → stable runtime → `src/cli/index.ts start` → `/readyz` | all first-ship targets |
+| Installed App resource layout → stable runtime → `src/cli/index.ts start` → `/readyz` | all first-ship targets |
 | Target-native module load (no host-arch stand-in) | all first-ship targets |
 | Session bootstrap, CSRF write, 6-minute hide/reopen renewal | all first-ship WebViews |
 | Exact-origin navigation + system-browser handoff | all first-ship WebViews |

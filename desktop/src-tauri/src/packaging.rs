@@ -14,6 +14,7 @@ pub const STABLE_RUNTIME_DIR_NAME: &str = "runtime";
 pub const CURRENT_POINTER_NAME: &str = "current.json";
 pub const STABLE_VERSIONS_DIR: &str = "versions";
 pub const BRIDGE_SCRIPT_REL: &str = "desktop/runtime/bootstrap.ts";
+pub const INSTALL_SCRIPT_REL: &str = "desktop/runtime/install.ts";
 pub const DEBUG_BRIDGE_BIN_ENV: &str = "OCX_DESKTOP_BRIDGE_BIN";
 pub const DEBUG_RUNTIME_ROOT_ENV: &str = "OCX_DESKTOP_RUNTIME_ROOT";
 pub const SIDECAR_STUB_MARKER: &str = "OCX_DESKTOP_SIDECAR_STUB";
@@ -77,7 +78,7 @@ pub struct BridgeLayout {
     pub debug_cwd: Option<PathBuf>,
 }
 
-fn is_target_triple(value: &str) -> bool {
+pub fn is_target_triple(value: &str) -> bool {
     TARGET_TRIPLES.contains(&value)
 }
 
@@ -318,7 +319,7 @@ pub fn validate_directory(path: &Path) -> Result<(), ResolveError> {
     Ok(())
 }
 
-fn parse_version_pointer(value: &Value) -> Result<VersionPointer, ResolveError> {
+pub fn parse_version_pointer(value: &Value) -> Result<VersionPointer, ResolveError> {
     let obj = as_object(value)?;
     exact_keys(obj, &VERSION_POINTER_KEYS)?;
     let id = obj["id"]
@@ -501,10 +502,46 @@ fn require_bridge_script(cwd: &Path) -> Result<(), ResolveError> {
     Ok(())
 }
 
+pub fn require_install_script(cwd: &Path) -> Result<(), ResolveError> {
+    let script = contained_join(cwd, INSTALL_SCRIPT_REL)?;
+    let script_meta = lstat(&script)
+        .map_err(|_| ResolveError::new("packaged runtime is missing the installer script"))?;
+    reject_symlink(
+        &script_meta,
+        "packaged runtime is missing the installer script",
+    )?;
+    if !script_meta.is_file() {
+        return Err(ResolveError::new(
+            "packaged runtime is missing the installer script",
+        ));
+    }
+    Ok(())
+}
+
 pub fn validate_spawn_paths(program: &Path, cwd: &Path) -> Result<(), ResolveError> {
     validate_regular_executable(program)?;
     validate_directory(cwd)?;
     require_bridge_script(cwd)
+}
+
+pub fn validate_installer_spawn_paths(program: &Path, cwd: &Path) -> Result<(), ResolveError> {
+    validate_regular_executable(program)?;
+    validate_directory(cwd)?;
+    require_install_script(cwd)
+}
+
+pub fn should_run_packaged_staging(layout: &BridgeLayout) -> bool {
+    !(layout.allow_debug_env && layout.debug_cwd.is_some())
+}
+
+pub fn resolve_packaged_runtime_source(layout: &BridgeLayout) -> Result<PathBuf, ResolveError> {
+    let source = layout
+        .resource_runtime_dir
+        .as_ref()
+        .ok_or_else(|| ResolveError::new("packaged runtime resources are unavailable"))?;
+    validate_directory(source)?;
+    require_install_script(source)?;
+    Ok(source.clone())
 }
 
 pub fn resolve_bridge_cwd(layout: &BridgeLayout) -> Result<PathBuf, ResolveError> {
@@ -529,25 +566,31 @@ pub fn layout_from_app<R: Runtime>(app: &AppHandle<R>) -> Result<BridgeLayout, R
     if tauri_external_bin_entry() != SIDECAR_CONFIG_PATH {
         return Err(ResolveError::new("packaged runtime bridge is missing"));
     }
-    let resource_runtime_dir = app
-        .path()
-        .resource_dir()
-        .ok()
-        .and_then(|root| resolve_resource_runtime_dir(&root).ok());
+    let allow_debug_env = debug_env_selection_allowed();
+    let debug_program = debug_env_path(allow_debug_env, DEBUG_BRIDGE_BIN_ENV);
+    let debug_cwd = debug_env_path(allow_debug_env, DEBUG_RUNTIME_ROOT_ENV);
+    let resource_runtime_dir = if allow_debug_env && debug_cwd.is_some() {
+        None
+    } else {
+        let resource_root = app
+            .path()
+            .resource_dir()
+            .map_err(|_| ResolveError::new("packaged runtime resources are unavailable"))?;
+        Some(resolve_resource_runtime_dir(&resource_root)?)
+    };
     let stable_root = app
         .path()
         .app_local_data_dir()
         .map_err(|_| ResolveError::new("no published runtime current is available"))?
         .join(STABLE_RUNTIME_DIR_NAME);
-    let allow_debug_env = debug_env_selection_allowed();
     Ok(BridgeLayout {
         sidecar_dir,
         resource_runtime_dir,
         stable_root,
         target_triple,
         allow_debug_env,
-        debug_program: debug_env_path(allow_debug_env, DEBUG_BRIDGE_BIN_ENV),
-        debug_cwd: debug_env_path(allow_debug_env, DEBUG_RUNTIME_ROOT_ENV),
+        debug_program,
+        debug_cwd,
     })
 }
 
@@ -664,6 +707,7 @@ mod tests {
         assert_eq!(SIDECAR_CONFIG_PATH, "binaries/ocx-runtime");
         assert!(!SIDECAR_CONFIG_PATH.contains("x86_64"));
         assert_eq!(RUNTIME_RESOURCE_REL, "resources/runtime");
+        assert_eq!(INSTALL_SCRIPT_REL, "desktop/runtime/install.ts");
     }
 
     #[test]
@@ -728,6 +772,7 @@ mod tests {
         let cwd = resolve_bridge_cwd(&layout).unwrap();
         assert_eq!(program, env_bin);
         assert_eq!(cwd, script_root);
+        assert!(!should_run_packaged_staging(&layout));
     }
 
     #[cfg(unix)]
@@ -812,9 +857,43 @@ mod tests {
     fn resource_runtime_dir_rejects_parent_segments() {
         let tree = TempTree::new();
         write_file(&tree.path("resources/runtime/.keep"), b"", false);
+        write_file(
+            &tree.path("resources/runtime/desktop/runtime/install.ts"),
+            b"export {}\n",
+            false,
+        );
         let resolved = resolve_resource_runtime_dir(&tree.root).unwrap();
         assert_eq!(resolved, tree.path("resources/runtime"));
+        let layout = BridgeLayout {
+            sidecar_dir: tree.root.clone(),
+            resource_runtime_dir: Some(resolved.clone()),
+            stable_root: tree.path("stable"),
+            target_triple: "x86_64-unknown-linux-gnu".to_string(),
+            allow_debug_env: false,
+            debug_program: None,
+            debug_cwd: None,
+        };
+        assert!(should_run_packaged_staging(&layout));
+        assert_eq!(resolve_packaged_runtime_source(&layout).unwrap(), resolved);
         assert!(validate_relative_posix("../secret").is_err());
         assert!(validate_relative_posix("/tmp/runtime").is_err());
+    }
+
+    #[test]
+    fn packaged_runtime_source_requires_the_fixed_installer_script() {
+        let tree = TempTree::new();
+        fs::create_dir_all(tree.path("runtime")).unwrap();
+        let layout = BridgeLayout {
+            sidecar_dir: tree.root.clone(),
+            resource_runtime_dir: Some(tree.path("runtime")),
+            stable_root: tree.path("stable"),
+            target_triple: "x86_64-unknown-linux-gnu".to_string(),
+            allow_debug_env: false,
+            debug_program: None,
+            debug_cwd: None,
+        };
+        let err = resolve_packaged_runtime_source(&layout).unwrap_err();
+        assert_eq!(err.code(), "runtime_integrity_failed");
+        assert!(!err.message().contains(tree.root.to_str().unwrap()));
     }
 }

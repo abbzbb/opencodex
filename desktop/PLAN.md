@@ -85,6 +85,7 @@ OpenCodex App (Tauri 2)
   |
   |- bundled bootstrap payload (signed App resources)
   |    |- ocx-runtime-$TARGET_TRIPLE[.exe]   # Bun external binary
+  |    |- desktop/runtime/install.ts         # packaged-resource staging bridge
   |    |- desktop/runtime/bootstrap.ts       # short-lived JSON bridge
   |    |- package.json
   |    |- src/
@@ -298,7 +299,7 @@ bridge 只有在以下证据全部一致时才认定 `desktop-direct`：PID 通�
 
 ### 第 1 期：功能 MVP 窗口与托盘
 
-当前进度（2026-08-29）：Tauri 工程、共享 start/stop/owner seam、v1 bridge、窗口/托盘/single-instance 骨架及 target-native runtime payload builder 已落地。builder 在目标主机用 Bun `--production --frozen-lockfile --ignore-scripts` 生成闭包，只保留匹配 target 的 Bun/keyring 原生包，最后写入并复验 manifest；release `build.rs` 在没有真实 payload 时拒绝继续。尚未完成的是 packaged resource 到 per-user stable runtime 的首次启动接线、真实 WebView/安装产物 smoke，以及 service/update/deep-link 后续期。
+当前进度（2026-08-30）：Tauri 工程、共享 start/stop/owner seam、v1 bridge、窗口/托盘/single-instance 骨架、target-native runtime payload builder，以及 packaged resource 到 per-user stable runtime 的首次启动接线已落地。builder 在目标主机用 Bun `--production --frozen-lockfile --ignore-scripts` 生成闭包，只保留匹配 target 的 Bun/keyring 原生包，最后写入并复验 manifest；release `build.rs` 在没有真实 payload 时拒绝继续。App 启动先通过独立固定 argv 的 `desktop/runtime/install.ts` 校验并部署资源：无 `current` 时原子发布，同版本仅在规范化 manifest 完全一致时复用，已有不同 `current` 时只 stage 候选而不提前切换。中断遗留的临时 staging 树由下一次成功持锁的部署清理；版本树保留到具备 service/PID 所有权证据的更新事务。尚未完成的是真实 WebView/安装产物资源布局 smoke，以及 service/update/deep-link 后续期。
 
 工作项：
 

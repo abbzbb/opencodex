@@ -10,12 +10,24 @@ use tauri::{AppHandle, Runtime};
 use crate::codec::{decode_stdout_object, MAX_IO_BYTES};
 use crate::packaging::{
     layout_from_app, resolve_bridge_cwd, resolve_bridge_program, validate_spawn_paths,
-    ResolveError, BRIDGE_SCRIPT_REL, DEBUG_BRIDGE_BIN_ENV, DEBUG_RUNTIME_ROOT_ENV,
+    BridgeLayout, ResolveError, BRIDGE_SCRIPT_REL, DEBUG_BRIDGE_BIN_ENV, DEBUG_RUNTIME_ROOT_ENV,
 };
 use crate::protocol::{exit_code_for_envelope, validate_envelope, IssuedRequest};
 
 /// Sidecar argv is closed. Operation, request JSON, and tokens never appear here.
 pub const BRIDGE_SCRIPT_ARGV: [&str; 1] = [BRIDGE_SCRIPT_REL];
+const BLOCKED_CHILD_ENV: [&str; 10] = [
+    "BUN_INSPECT",
+    "BUN_OPTIONS",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "LD_PRELOAD",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "OPENSSL_CONF",
+    "DOTENV_CONFIG_PATH",
+    "WIN_DLL",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeSpec {
@@ -134,20 +146,24 @@ fn truncate_log(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn bounded_read(reader: &mut impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
+    let mut captured = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
         let n = reader.read(&mut chunk)?;
         if n == 0 {
             break;
         }
-        if buf.len() + n > limit {
-            buf.extend_from_slice(&chunk[..limit.saturating_sub(buf.len())]);
-            break;
+        let remaining = limit.saturating_sub(captured.len());
+        if remaining > 0 {
+            captured.extend_from_slice(&chunk[..n.min(remaining)]);
         }
-        buf.extend_from_slice(&chunk[..n]);
     }
-    Ok(buf)
+    Ok(captured)
+}
+
+fn terminate_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn wait_with_timeout(
@@ -160,12 +176,12 @@ fn wait_with_timeout(
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
             Ok(None) if started.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_child(child);
                 return Err(BridgeClientError::DeadlineExceeded { operation });
             }
             Ok(None) => thread::sleep(Duration::from_millis(20)),
             Err(_) => {
+                terminate_child(child);
                 return Err(BridgeClientError::Spawn {
                     message: "failed to start the runtime bridge".to_string(),
                 });
@@ -202,15 +218,21 @@ pub fn invoke_bridge(
         .stderr(Stdio::piped())
         .env_remove(DEBUG_BRIDGE_BIN_ENV)
         .env_remove(DEBUG_RUNTIME_ROOT_ENV);
+    for key in BLOCKED_CHILD_ENV {
+        command.env_remove(key);
+    }
     let mut child = command.spawn().map_err(|_| BridgeClientError::Spawn {
         message: "failed to start the runtime bridge".to_string(),
     })?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(request.encode().as_bytes())
-            .map_err(|_| BridgeClientError::Spawn {
-                message: "failed to start the runtime bridge".to_string(),
-            })?;
+    let write_failed = match child.stdin.take() {
+        Some(mut stdin) => stdin.write_all(request.encode().as_bytes()).is_err(),
+        None => true,
+    };
+    if write_failed {
+        terminate_child(&mut child);
+        return Err(BridgeClientError::Spawn {
+            message: "failed to start the runtime bridge".to_string(),
+        });
     }
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
@@ -223,9 +245,10 @@ pub fn invoke_bridge(
         None => Vec::new(),
     });
     let timeout = Duration::from_millis(request.operation().deadline_ms());
-    let status = wait_with_timeout(&mut child, timeout, request.operation().as_str())?;
+    let status = wait_with_timeout(&mut child, timeout, request.operation().as_str());
     let stdout = stdout_handle.join().unwrap_or_else(|_| Vec::new());
     let stderr = stderr_handle.join().unwrap_or_else(|_| Vec::new());
+    let status = status?;
     let exit_code = status.code().unwrap_or(1);
     interpret_bridge_output(
         request,
@@ -241,8 +264,12 @@ pub fn default_bridge_spec<R: Runtime>(
     app: &AppHandle<R>,
 ) -> Result<BridgeSpec, BridgeClientError> {
     let layout = layout_from_app(app)?;
-    let program = resolve_bridge_program(&layout)?;
-    let cwd = resolve_bridge_cwd(&layout)?;
+    bridge_spec_from_layout(&layout)
+}
+
+pub fn bridge_spec_from_layout(layout: &BridgeLayout) -> Result<BridgeSpec, BridgeClientError> {
+    let program = resolve_bridge_program(layout)?;
+    let cwd = resolve_bridge_cwd(layout)?;
     validate_spawn_paths(&program, &cwd)?;
     Ok(BridgeSpec::new(program, cwd))
 }
@@ -290,6 +317,9 @@ mod tests {
         let req = bootstrap_request();
         assert!(!spec.args.iter().any(|arg| arg == req.request_id()));
         assert!(!spec.program.as_os_str().is_empty());
+        for key in ["NODE_OPTIONS", "BUN_INSPECT", "LD_PRELOAD"] {
+            assert!(BLOCKED_CHILD_ENV.contains(&key));
+        }
     }
 
     #[test]
