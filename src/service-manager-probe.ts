@@ -323,7 +323,7 @@ function inspectLaunchd(deps: Required<Pick<ProbeDeps, "run" | "uid" | "home">>)
   };
 }
 
-function systemdProperty(out: string, key: string): string | null {
+export function systemdProperty(out: string, key: string): string | null {
   for (const line of out.split("\n")) {
     const match = line.match(new RegExp(`^${key}=(.*)$`));
     if (match) return match[1].trim();
@@ -681,7 +681,19 @@ function inspectWindows(
   }
 
   if (task === "absent") {
-    return schedulerRegistered
+    if (!schedulerRegistered) return { kind: "absent" };
+    if (!registration.registeredXml.trim()) {
+      return unknown("Task Scheduler is registered but its definition XML could not be read");
+    }
+    const launcherArg = windowsTaskArguments(registration.registeredXml);
+    if (!launcherArg) {
+      return unknown("Task Scheduler holds opencodex-proxy but its task XML is missing");
+    }
+    const launcherPath = /"([^"]+)"/.exec(launcherArg)?.[1];
+    if (!launcherPath) {
+      return unknown("Task Scheduler holds opencodex-proxy but its task XML is missing");
+    }
+    return windowsPathInsideConfigDir(launcherPath, configDir)
       ? unknown("Task Scheduler holds opencodex-proxy but its task XML is missing")
       : { kind: "absent" };
   }

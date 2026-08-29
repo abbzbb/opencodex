@@ -1,6 +1,6 @@
 {
   "name": "@bitkyc08/opencodex",
-  "version": "2.35.0",
+  "version": "2.36.0",
   "description": "Universal provider proxy for OpenAI Codex & Claude Code — use any LLM with Codex CLI/App/SDK and Claude Code",
   "type": "module",
   "main": "./bin/package-main.mjs",
@@ -40,6 +40,7 @@
     "start": "bun run src/cli/index.ts start",
     "test": "bun scripts/test.ts",
     "test:desktop": "bun scripts/test.ts --root ./desktop/tests",
+    "test:changed": "bun scripts/test.ts --changed=dev",
     "typecheck": "bun x tsc --noEmit",
     "typecheck:desktop": "bun x tsc -p desktop/tsconfig.json --noEmit",
     "check:desktop": "bun run typecheck:desktop && bun run test:desktop",

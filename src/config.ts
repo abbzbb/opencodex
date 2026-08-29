@@ -61,6 +61,7 @@ import { providerDestinationConfigError } from "./lib/destination-policy";
 import { redactSecretString } from "./lib/redact";
 import { openRouterRoutingConfigError } from "./providers/openrouter-routing";
 import { MODEL_ALIAS_PATTERN } from "./providers/default-aliases";
+import { vercelGatewayRoutingConfigError } from "./providers/vercel-gateway-routing";
 import {
   MODEL_ADAPTER_OVERRIDE_ALLOWED,
   OPENAI_PROVIDER_TIER_VERSION,
@@ -530,6 +531,7 @@ const providerConfigSchema = z.object({
     repairInvalidIds: z.boolean().optional(),
   }).strict().optional(),
   responsesSnapshotRepair: z.boolean().optional(),
+  xaiResponsesXSearch: z.boolean().optional(),
 }).passthrough();
 
 export { isValidProviderName, hasOwnProvider } from "./config/provider-name";
@@ -930,6 +932,7 @@ const configSchema = z.object({
   // parse: a hand-edited typo must never trip the backup-and-defaults repair
   // path below and wipe providers/pool accounts. Warning emitted in loadConfig.
   streamMode: z.enum(["auto", "legacy-tee", "eager-relay"]).optional().catch(undefined),
+  blockedModelRedirects: z.record(z.string(), z.string()).optional().catch(undefined),
   // Same degrade-don't-reject rationale as the fields above: a hand-edited
   // non-string must not trip the backup-and-defaults repair path. Unset then
   // takes the canonical sideband path (src/server/live.ts normalizeSidebandRoot).
@@ -1028,6 +1031,20 @@ const configSchema = z.object({
             : "openRouterRouting",
         ],
         message: openRouterRoutingError,
+      });
+    }
+    const vercelRoutingError = vercelGatewayRoutingConfigError(provider);
+    if (vercelRoutingError) {
+      ctx.addIssue({
+        code: "custom",
+        path: [
+          "providers",
+          redactSecretString(name),
+          vercelRoutingError.startsWith("modelVercelGatewayRouting")
+            ? "modelVercelGatewayRouting"
+            : "vercelGatewayRouting",
+        ],
+        message: vercelRoutingError,
       });
     }
     if (Object.hasOwn(provider, "virtualModels")) {

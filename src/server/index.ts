@@ -20,6 +20,7 @@ import {
   getConfigDir,
   websocketsEnabled,
 } from "../config";
+import { grokDefaultReasoningEffort } from "../grok/effort";
 import { reconcileOAuthProviders } from "../oauth";
 import { withCatalogWriteSerialization } from "../codex/catalog-write-serialization";
 import { invalidateCodexModelsCacheWithPermit } from "../codex/catalog/sync";
@@ -441,6 +442,37 @@ function attachLiveSidebandUpstream(
 // isNativePassthroughSseResponse(response)
 // trackSseForRequestLog(
 // export function relaySseWithHeartbeat
+
+const REQUEST_LOG_ID_RESPONSE_HEADER = "x-opencodex-request-id";
+
+function withRequestLogId(response: Response, requestId: string): Response {
+  const headers = new Headers(response.headers);
+  headers.set(REQUEST_LOG_ID_RESPONSE_HEADER, requestId);
+  // A custom `x-` header is not CORS-safelisted, so cross-origin JavaScript gets null from
+  // `response.headers.get()` even though the header is on the wire. Naming it here is what
+  // makes the id readable by a browser client — the only caller that needs a correlation id
+  // it did not send itself.
+  //
+  // Appending to whatever `withCors` already set, rather than overwriting, keeps this
+  // independent of the CORS layer: if the data plane later exposes another header, both
+  // survive. Duplicate names are harmless, and the header stays absent from responses that
+  // never reach this wrapper, so no management or rejected-origin response is widened.
+  const exposed = headers.get("Access-Control-Expose-Headers");
+  const already = (exposed ?? "")
+    .split(",")
+    .some(name => name.trim().toLowerCase() === REQUEST_LOG_ID_RESPONSE_HEADER);
+  if (!already) {
+    headers.set(
+      "Access-Control-Expose-Headers",
+      exposed ? `${exposed}, ${REQUEST_LOG_ID_RESPONSE_HEADER}` : REQUEST_LOG_ID_RESPONSE_HEADER,
+    );
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
 
 export interface StartServerDeps {
   /** Test-only seam; production always initializes its own management credential state. */
@@ -1038,7 +1070,10 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
         try {
           [goModels, modelEntitlements] = await Promise.all([
             fetchAllModels(config),
-            resolveCodexModelEntitlements(config),
+            // Codex sends its own client_version on this request, and upstream filters the
+            // entitlement roster by it. Passing it through is what stops an entitled account
+            // being told it cannot use models a newer client can (#2886).
+            resolveCodexModelEntitlements(config, { clientVersion: url.searchParams.get("client_version") }),
           ]);
         } catch (error) {
           if (error instanceof CatalogGatherBusyError) {
@@ -1195,10 +1230,8 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
           ...(isDefault ? { default: true } : {}),
         });
         const grokEffortFields = (efforts: string[], configuredDefault?: string) => {
-          if (efforts.length === 0) return {};
-          const defaultEffort = configuredDefault && efforts.includes(configuredDefault)
-            ? configuredDefault
-            : efforts.includes("medium") ? "medium" : efforts.includes("high") ? "high" : efforts[0];
+          const defaultEffort = grokDefaultReasoningEffort(efforts, configuredDefault);
+          if (defaultEffort === undefined) return {};
           return {
             supports_reasoning_effort: true,
             reasoning_effort: defaultEffort,
@@ -1426,7 +1459,10 @@ export function startServer(port?: number, deps: StartServerDeps = {}): Server<W
               finalizeNativePassthroughLog(499, { closeReason: "client_cancel" });
             },
           });
-          return withCors(responseWithDeferredRequestLog(response, requestId, start, logCtx), req, policy);
+          return withRequestLogId(
+            withCors(responseWithDeferredRequestLog(response, requestId, start, logCtx), req, policy),
+            requestId,
+          );
         });
       }
 
