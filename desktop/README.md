@@ -73,6 +73,13 @@ bun scripts/test.ts --root ./desktop/tests
 cargo fmt --check --manifest-path desktop/src-tauri/Cargo.toml
 cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path desktop/src-tauri/Cargo.toml
+
+# Target-native payload (run on the matching target host)
+bun desktop/scripts/build-runtime.ts \
+  --target x86_64-unknown-linux-gnu \
+  --output desktop/src-tauri/resources/runtime
+bun desktop/scripts/validate-packaging.ts --require-real \
+  --target x86_64-unknown-linux-gnu
 ```
 
 Do not run the repository-wide `bun run test` for desktop-only runtime/staging
@@ -80,10 +87,13 @@ work.
 
 ## Current limitations
 
-- Phase 0. The shell, bridge, and stable runtime are not a releasable App yet.
-- Manifest generation and stable staging are Bun-native and injectable
-  (`expectedTarget`, `enforceExecutableBit`). They are not yet driven by a
-  packaged Tauri resource resolver.
+- Phase 1 foundation. The shell, bridge, and stable runtime are not a releasable App yet.
+- Target-native payload generation now produces a production dependency closure,
+  target Bun/keyring packages, and a verified manifest. Debug builds may create a
+  compile placeholder, while release builds require the real resource payload.
+- Stable staging is Bun-native and injectable (`expectedTarget`,
+  `enforceExecutableBit`), but App startup does not yet deploy the packaged Tauri
+  resource into the per-user stable root before bridge bootstrap.
 - `current.json` is an atomic file pointer. It is not a symlink contract.
 - One rollback generation is retained. Older trees are pruned only when no
   current/previous pointer or `isVersionReferenced` guard names them.

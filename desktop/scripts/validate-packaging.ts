@@ -1,31 +1,58 @@
 #!/usr/bin/env bun
-import { lstatSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, readdirSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-
-const TARGET_TRIPLES = [
-  "aarch64-apple-darwin",
-  "x86_64-apple-darwin",
-  "x86_64-pc-windows-msvc",
-  "aarch64-pc-windows-msvc",
-  "x86_64-unknown-linux-gnu",
-  "aarch64-unknown-linux-gnu",
-] as const;
+import {
+  MANIFEST_FILE_NAME,
+  TARGET_TRIPLES,
+  readRuntimeManifestFile,
+  verifyRuntimeTree,
+  type TargetTriple,
+} from "../runtime/manifest";
+import {
+  hostTargetTriple,
+  keyringNativeFileForTarget,
+  keyringPackageForTarget,
+  runtimeBinaryName,
+  validateNativeBinaryForTarget,
+} from "./build-runtime";
 
 const SIDECAR_BIN_NAME = "ocx-runtime";
 const SIDECAR_CONFIG_PATH = "binaries/ocx-runtime";
 const RUNTIME_RESOURCE_REL = "resources/runtime";
 const STUB_MARKER = "OCX_DESKTOP_SIDECAR_STUB";
-const ELF_EM_X86_64 = 62;
-const ELF_EM_AARCH64 = 183;
-
-type TargetTriple = (typeof TARGET_TRIPLES)[number];
+const REQUIRED_RUNTIME_ENTRIES = [
+  "package.json",
+  "src/cli/index.ts",
+  "desktop/runtime/bootstrap.ts",
+  "gui/dist/index.html",
+] as const;
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const desktopRoot = join(scriptDir, "..");
 const srcTauri = join(desktopRoot, "src-tauri");
 const requireReal = process.argv.includes("--require-real");
+
+function parseRequestedTarget(): TargetTriple | undefined {
+  const args = process.argv.slice(2);
+  let target: TargetTriple | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--require-real") continue;
+    if (arg !== "--target") fail(`unknown argument: ${arg ?? ""}`);
+    const value = args[index + 1];
+    if (!value || !(TARGET_TRIPLES as readonly string[]).includes(value)) {
+      fail("--target must name a closed Desktop target triple");
+    }
+    if (target) fail("--target may only be specified once");
+    target = value as TargetTriple;
+    index += 1;
+  }
+  return target;
+}
+
+const requestedTarget = parseRequestedTarget();
 
 function fail(message: string): never {
   console.error(`validate-packaging: ${message}`);
@@ -62,37 +89,108 @@ function parseSidecarFileName(name: string): { triple: TargetTriple; windows: bo
   return { triple, windows };
 }
 
-function elfMachine(bytes: Uint8Array): number | null {
-  if (bytes.length < 20) {
-    return null;
-  }
-  if (bytes[0] !== 0x7f || bytes[1] !== 0x45 || bytes[2] !== 0x4c || bytes[3] !== 0x46) {
-    return null;
-  }
-  const little = bytes[5] === 1;
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  return view.getUint16(18, little);
-}
-
-function expectedElfMachine(triple: TargetTriple): number | null {
-  if (triple === "x86_64-unknown-linux-gnu") {
-    return ELF_EM_X86_64;
-  }
-  if (triple === "aarch64-unknown-linux-gnu") {
-    return ELF_EM_AARCH64;
-  }
-  return null;
-}
-
 function sha256(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-function isExecutable(mode: number): boolean {
-  return (mode & 0o111) !== 0;
+function containsStubMarker(bytes: Uint8Array): boolean {
+  return Buffer.from(bytes).toString("utf8").includes(STUB_MARKER);
+}
+
+function validateNative(path: string, target: TargetTriple, requireExecutable = true): void {
+  try {
+    validateNativeBinaryForTarget(path, target, { requireExecutable });
+  } catch (error) {
+    fail(error instanceof Error ? error.message : "native binary validation failed");
+  }
+}
+
+function hasRequiredRuntimeEntry(
+  paths: ReadonlySet<string>,
+  required: string,
+): boolean {
+  if (paths.has(required)) {
+    return true;
+  }
+  const prefix = `${required}/`;
+  for (const path of paths) {
+    if (path.startsWith(prefix)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function validatePackagedRuntime(runtimeDir: string, expectedTarget?: TargetTriple): boolean {
+  let runtimeStat;
+  try {
+    runtimeStat = lstatSync(runtimeDir);
+  } catch {
+    return false;
+  }
+  if (runtimeStat.isSymbolicLink()) {
+    fail(`packaged runtime must not be a symlink: ${RUNTIME_RESOURCE_REL}`);
+  }
+  if (!runtimeStat.isDirectory()) {
+    fail(`packaged runtime must be a directory: ${RUNTIME_RESOURCE_REL}`);
+  }
+
+  const manifestPath = join(runtimeDir, MANIFEST_FILE_NAME);
+  let manifestStat;
+  try {
+    manifestStat = lstatSync(manifestPath);
+  } catch {
+    return false;
+  }
+  if (manifestStat.isSymbolicLink()) {
+    fail(`${MANIFEST_FILE_NAME} must not be a symlink`);
+  }
+  if (!manifestStat.isFile()) {
+    fail(`${MANIFEST_FILE_NAME} must be a regular file`);
+  }
+
+  const loaded = readRuntimeManifestFile(manifestPath);
+  if (!loaded.ok) {
+    fail(`invalid ${MANIFEST_FILE_NAME}: ${loaded.message}`);
+  }
+  if (expectedTarget && loaded.manifest.target !== expectedTarget) {
+    fail(`packaged runtime target does not match ${expectedTarget}`);
+  }
+  const verified = verifyRuntimeTree(runtimeDir, loaded.manifest, {
+    expectedTarget: loaded.manifest.target,
+    allowManifestFile: true,
+  });
+  if (!verified.ok) {
+    fail(`packaged runtime verification failed: ${verified.message}`);
+  }
+
+  const listed = new Set(loaded.manifest.files.map((file) => file.path));
+  for (const required of REQUIRED_RUNTIME_ENTRIES) {
+    if (!hasRequiredRuntimeEntry(listed, required)) {
+      fail(`packaged runtime missing required entry: ${required}`);
+    }
+  }
+
+  const expectedBin = runtimeBinaryName(loaded.manifest.target);
+  const expectedKeyring = `node_modules/${keyringPackageForTarget(loaded.manifest.target)}/${keyringNativeFileForTarget(loaded.manifest.target)}`;
+  for (const required of [expectedBin, expectedKeyring]) {
+    if (!listed.has(required)) fail(`packaged runtime missing required entry: ${required}`);
+  }
+  const binPath = join(runtimeDir, expectedBin);
+  if (!existsSync(binPath)) {
+    fail(`packaged runtime missing sidecar file ${expectedBin}`);
+  }
+  const binStat = lstatSync(binPath);
+  if (binStat.isSymbolicLink()) {
+    fail(`packaged runtime sidecar must not be a symlink: ${expectedBin}`);
+  }
+  validateNative(binPath, loaded.manifest.target);
+  validateNative(join(runtimeDir, ...expectedKeyring.split("/")), loaded.manifest.target, false);
+  return true;
 }
 
 const tauriConf = JSON.parse(readFileSync(join(srcTauri, "tauri.conf.json"), "utf8")) as {
+  version?: unknown;
   bundle?: {
     externalBin?: unknown;
     resources?: unknown;
@@ -104,6 +202,19 @@ const tauriConf = JSON.parse(readFileSync(join(srcTauri, "tauri.conf.json"), "ut
   };
   plugins?: { updater?: unknown };
 };
+const rootPackage = JSON.parse(readFileSync(join(desktopRoot, "..", "package.json"), "utf8")) as {
+  version?: unknown;
+};
+const desktopPackage = JSON.parse(readFileSync(join(desktopRoot, "package.json"), "utf8")) as {
+  version?: unknown;
+};
+if (
+  typeof rootPackage.version !== "string"
+  || rootPackage.version !== desktopPackage.version
+  || rootPackage.version !== tauriConf.version
+) {
+  fail("root, Desktop package, and Tauri versions must match");
+}
 
 if (JSON.stringify(tauriConf.bundle?.externalBin) !== JSON.stringify([SIDECAR_CONFIG_PATH])) {
   fail(`bundle.externalBin must be ["${SIDECAR_CONFIG_PATH}"]`);
@@ -152,19 +263,6 @@ try {
 
 let realSidecarCount = 0;
 let stubCount = 0;
-function hostLinuxTriple(): TargetTriple | null {
-  if (process.platform !== "linux") {
-    return null;
-  }
-  if (process.arch === "arm64") {
-    return "aarch64-unknown-linux-gnu";
-  }
-  if (process.arch === "x64") {
-    return "x86_64-unknown-linux-gnu";
-  }
-  return null;
-}
-
 for (const name of names) {
   if (name === ".gitignore") {
     continue;
@@ -186,43 +284,47 @@ for (const name of names) {
   if (!/^[a-f0-9]{64}$/.test(digest)) {
     fail(`unable to hash sidecar: ${name}`);
   }
-  const asText = Buffer.from(bytes).toString("utf8");
-  const isStub = asText.includes(STUB_MARKER);
+  const isStub = containsStubMarker(bytes);
   if (isStub) {
+    const expected = parsed.windows
+      ? Buffer.from("MZOCX_DESKTOP_SIDECAR_STUB")
+      : Buffer.from("#!/bin/sh\necho OCX_DESKTOP_SIDECAR_STUB >&2\nexit 2\n");
+    if (!Buffer.from(bytes).equals(expected)) {
+      fail(`invalid compile placeholder: ${name}`);
+    }
     stubCount += 1;
     continue;
   }
   realSidecarCount += 1;
-  const expectedMachine = expectedElfMachine(parsed.triple);
-  if (expectedMachine !== null) {
-    if (process.platform !== "win32" && !isExecutable(st.mode)) {
-      fail(`unix sidecar is not executable: ${name}`);
-    }
-    const machine = elfMachine(bytes);
-    if (machine !== expectedMachine) {
-      fail(`sidecar architecture does not match ${parsed.triple}`);
-    }
-  }
+  validateNative(abs, parsed.triple);
 }
 
+let requiredTarget = requestedTarget;
+if (requireReal && !requiredTarget) {
+  requiredTarget = hostTargetTriple() ?? fail("this host is outside the closed Desktop target set");
+}
+const runtimeDir = join(srcTauri, RUNTIME_RESOURCE_REL);
+const packagedRuntimeVerified = validatePackagedRuntime(runtimeDir, requiredTarget);
+
 if (requireReal) {
+  if (!requiredTarget) fail("a closed Desktop target is required");
   if (stubCount > 0 && realSidecarCount === 0) {
     fail("a real ocx-runtime sidecar is required; only a compile placeholder is present");
   }
-  const hostTriple = hostLinuxTriple();
-  if (hostTriple) {
-    const expectedName = sidecarSourceFileName(hostTriple);
-    const hasHost = names.includes(expectedName);
-    if (!hasHost) {
-      fail(`missing host sidecar ${expectedName}`);
-    }
-    const bytes = new Uint8Array(readFileSync(join(binariesDir, expectedName)));
-    if (Buffer.from(bytes).toString("utf8").includes(STUB_MARKER)) {
-      fail("host sidecar is a compile placeholder, not a real runtime");
-    }
+  const expectedName = sidecarSourceFileName(requiredTarget);
+  const hasHost = names.includes(expectedName);
+  if (!hasHost) {
+    fail(`missing host sidecar ${expectedName}`);
+  }
+  const bytes = new Uint8Array(readFileSync(join(binariesDir, expectedName)));
+  if (containsStubMarker(bytes)) {
+    fail("host sidecar is a compile placeholder, not a real runtime");
+  }
+  if (!packagedRuntimeVerified) {
+    fail("a verified packaged runtime is required");
   }
 }
 
 console.log(
-  `validate-packaging: ok (sidecars=${names.filter((name) => name !== ".gitignore").length}, real=${realSidecarCount}, stubs=${stubCount})`,
+  `validate-packaging: ok (sidecars=${names.filter((name) => name !== ".gitignore").length}, real=${realSidecarCount}, stubs=${stubCount}, packagedRuntime=${packagedRuntimeVerified ? "verified" : "absent"})`,
 );

@@ -322,6 +322,16 @@ mod tests {
     }
 
     #[test]
+    fn desktop_versions_match_the_runtime_package() {
+        let root: Value = serde_json::from_str(include_str!("../../../package.json")).unwrap();
+        let desktop: Value = serde_json::from_str(include_str!("../../package.json")).unwrap();
+        let tauri: Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(root["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(desktop["version"], root["version"]);
+        assert_eq!(tauri["version"], root["version"]);
+    }
+
+    #[test]
     fn capabilities_are_least_privilege_and_have_no_remote_ipc() {
         let raw = include_str!("../capabilities/main.json");
         let value: Value = serde_json::from_str(raw).unwrap();
@@ -351,6 +361,15 @@ mod tests {
         assert!(!cargo.contains("tauri-plugin-updater"));
         assert!(!cargo.contains("tauri-plugin-shell"));
         assert!(cargo.contains("tauri-plugin-single-instance"));
+    }
+
+    #[test]
+    fn release_build_requires_a_real_manifested_runtime() {
+        let build = include_str!("../build.rs");
+        assert!(build.contains("PROFILE"));
+        assert!(build.contains("release build requires a real target runtime payload"));
+        assert!(build.contains("resources/runtime/runtime-manifest.json"));
+        assert!(build.contains("binary_matches_target"));
     }
 
     #[test]

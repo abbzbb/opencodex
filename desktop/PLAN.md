@@ -4,9 +4,9 @@ Unit: `desktop/`
 Opened: 2026-08-29
 Reviewed: 2026-08-29
 Working branch: `app/desktop`（下游产品分支）
-Sync base: `abbzbb/opencodex` `main` @ `fc4de772b`（v2.35.0；上游为 `lidge-jun/opencodex`）
+Sync base: `abbzbb/opencodex` `dev` @ `c3da277bc`（v2.36.0；上游为 `lidge-jun/opencodex`）
 
-分支约定：当前 fork 只发布 `main`，因此 `app/desktop` 作为下游产品分支存在。若把通用改动回送上游，必须拆成独立 PR 并按上游策略以 `dev` 为目标；桌面打包与发布不得改写上游 npm `release.yml` 的契约。
+分支约定：`app/desktop` 作为下游产品分支存在，并通过 fork 的 `dev` 镜像运行 PR 门禁。若把通用改动回送上游，必须拆成独立 PR 并按上游策略以 `dev` 为目标；桌面打包与发布不得改写上游 npm `release.yml` 的契约。
 
 ## 1. 结论与完成定义
 
@@ -114,7 +114,7 @@ Rust 不重写 `findLiveProxy`、PID 身份、service 诊断、端口选择或 r
     "status": "ready",
     "origin": "http://localhost:10100",
     "pid": 1234,
-    "version": "2.35.0",
+    "version": "2.36.0",
     "owner": "desktop-direct",
     "allowedMutations": ["stop"]
   }
@@ -297,6 +297,8 @@ bridge 只有在以下证据全部一致时才认定 `desktop-direct`：PID 通�
 门禁：任一探针失败，先修壳、资源或 bridge；禁止通过放宽 management auth、CORS、XFO/CSP、PID identity 或 stop ownership 来过关。
 
 ### 第 1 期：功能 MVP 窗口与托盘
+
+当前进度（2026-08-29）：Tauri 工程、共享 start/stop/owner seam、v1 bridge、窗口/托盘/single-instance 骨架及 target-native runtime payload builder 已落地。builder 在目标主机用 Bun `--production --frozen-lockfile --ignore-scripts` 生成闭包，只保留匹配 target 的 Bun/keyring 原生包，最后写入并复验 manifest；release `build.rs` 在没有真实 payload 时拒绝继续。尚未完成的是 packaged resource 到 per-user stable runtime 的首次启动接线、真实 WebView/安装产物 smoke，以及 service/update/deep-link 后续期。
 
 工作项：
 

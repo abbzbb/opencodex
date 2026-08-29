@@ -1,12 +1,14 @@
 {
   "name": "opencodex-desktop",
   "private": true,
-  "version": "2.35.0",
+  "version": "2.36.0",
   "description": "OpenCodex Desktop App shell",
   "type": "module",
   "scripts": {
     "tauri": "tauri",
-    "validate:packaging": "bun scripts/validate-packaging.ts"
+    "build:runtime": "bun scripts/build-runtime.ts",
+    "validate:packaging": "bun scripts/validate-packaging.ts",
+    "validate:packaging:real": "bun scripts/validate-packaging.ts --require-real"
   },
   "devDependencies": {
     "@tauri-apps/cli": "2.11.4"
