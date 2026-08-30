@@ -93,6 +93,7 @@ describe("Codex catalog refresh", () => {
         path: "/tmp/missing-catalog.json",
         catalogWritten: false,
         comboOmissions: [],
+        skippedReason: "no_source",
       }),
       invalidateCodexModelsCache: () => {
         invalidated += 1;
@@ -105,6 +106,31 @@ describe("Codex catalog refresh", () => {
     expect(result.catalogWritten).toBe(false);
     expect(result.cacheSynced).toBe(false);
     expect(result.comboOmissions).toEqual([]);
+    expect(result.skippedReason).toBe("no_source");
+    expect(invalidated).toBe(0);
+  });
+
+  test("does not copy an unreadable on-disk catalog into the models cache", async () => {
+    let invalidated = 0;
+    const result = await refreshCodexModelCatalog(config, {
+      syncCatalogModels: async () => ({
+        added: 0,
+        path: "/tmp/malformed-catalog.json",
+        catalogWritten: false,
+        comboOmissions: [],
+        skippedReason: "unreadable_source",
+      }),
+      invalidateCodexModelsCache: () => {
+        invalidated += 1;
+        return true;
+      },
+      existsSync: () => true,
+    });
+
+    expect(result.catalogExists).toBe(true);
+    expect(result.catalogWritten).toBe(false);
+    expect(result.cacheSynced).toBe(false);
+    expect(result.skippedReason).toBe("unreadable_source");
     expect(invalidated).toBe(0);
   });
 

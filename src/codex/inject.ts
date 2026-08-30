@@ -1,4 +1,5 @@
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, statSync, unlinkSync } from "node:fs";
+import { classifyRegularFilePresence } from "./regular-file-presence";
 import {
   atomicWriteFile,
   loadConfig,
@@ -87,7 +88,7 @@ export function externalCodexModelProvider(content: string): string | null {
 }
 
 export function currentExternalCodexModelProvider(): string | null {
-  if (!existsSync(CODEX_CONFIG_PATH)) return null;
+  if (classifyCodexConfigPresence().kind !== "regular-file") return null;
   return externalCodexModelProvider(readFileSync(CODEX_CONFIG_PATH, "utf8"));
 }
 
@@ -666,8 +667,20 @@ export interface CodexInjectResult {
   success: boolean;
   message: string;
   status?: "skipped";
-  skippedReason?: "desired_disabled" | "desired_enabled";
+  skippedReason?: "desired_disabled" | "desired_enabled" | "no_config";
   nativeSubagentDefaultsWarning?: string;
+}
+
+/** Human log line for inject callers. A skip is not a green success. */
+export function formatCodexInjectOutcome(result: CodexInjectResult): string {
+  if (result.status === "skipped" || !result.success) return `⚠️  ${result.message}`;
+  return `✅ ${result.message}`;
+}
+
+const CODEX_CONFIG_PRESENCE_IO = { lstatSync, statSync };
+
+export function classifyCodexConfigPresence(path: string = CODEX_CONFIG_PATH): ReturnType<typeof classifyRegularFilePresence> {
+  return classifyRegularFilePresence(path, CODEX_CONFIG_PRESENCE_IO);
 }
 
 export async function injectCodexConfig(
@@ -686,10 +699,21 @@ export async function injectCodexConfig(
   // and matches what an already-running app-server read at startup.
   const loopback = config?.unauthenticatedLoopbackListener;
   if (loopback?.enabled) port = loopback.port;
-  if (!existsSync(CODEX_CONFIG_PATH)) {
+  const configPresence = classifyCodexConfigPresence(CODEX_CONFIG_PATH);
+  if (configPresence.kind === "absent") {
+    return {
+      success: true,
+      status: "skipped",
+      skippedReason: "no_config",
+      message: `Codex config not found at ${CODEX_CONFIG_PATH}. Is Codex installed?`,
+    };
+  }
+  if (configPresence.kind === "unreadable") {
     return {
       success: false,
-      message: `Codex config not found at ${CODEX_CONFIG_PATH}. Is Codex installed?`,
+      message:
+        `Codex config is not a usable regular file at ${CODEX_CONFIG_PATH} (${configPresence.reason}). ` +
+        "No Codex files were changed.",
     };
   }
 

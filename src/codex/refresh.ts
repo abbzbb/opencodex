@@ -14,7 +14,7 @@ export interface CodexCatalogRefreshResult {
   cacheSynced: boolean;
   comboOmissions: ComboCatalogOmission[];
   /** Desired OFF observed under K during the catalog commit; no cache write either. */
-  skippedReason?: "desired_disabled";
+  skippedReason?: "desired_disabled" | "no_source" | "unreadable_source";
 }
 
 interface RefreshDeps {
@@ -52,6 +52,11 @@ export async function refreshCodexModelCatalog(
   if (result.skippedReason === "desired_disabled") {
     // The commit path observed OFF under K. Invalidate nothing: rewriting the
     // models cache here would be exactly the routed-cache write the skip refused.
+    return { ...result, catalogExists, catalogWritten: false, cacheSynced: false, comboOmissions };
+  }
+  if (result.skippedReason === "unreadable_source") {
+    // A present but unparseable catalog/backup/cache must not be copied into the
+    // models cache. The sync caller turns this into a readiness-blocking warning.
     return { ...result, catalogExists, catalogWritten: false, cacheSynced: false, comboOmissions };
   }
   if (!catalogExists) {

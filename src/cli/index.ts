@@ -556,7 +556,11 @@ async function handleEnsure(options: { existingIsSuccess?: boolean } = {}): Prom
         console.error(`⚠️  Model sync skipped: ${e instanceof Error ? e.message : String(e)}`);
         return null;
       });
-      if (synced?.status === "skipped") console.log("   Codex integration OFF; startup left Codex native.");
+      if (synced?.status === "skipped" && synced.skippedReason === "desired_disabled") {
+        console.log("   Codex integration OFF; startup left Codex native.");
+      } else if (synced?.status === "skipped" && synced.skippedReason === "no_config") {
+        console.log(`   ${synced.message}`);
+      }
       // Ensure env file exists for already-running proxy (may have been deleted or pre-dates this feature).
       const systemEnv = await injectSystemEnv(live.port, config).catch(() => ({ injected: false }));
       reportShellHookFailure(reconcileShellHook(systemEnv.injected));
@@ -600,7 +604,11 @@ async function handleEnsure(options: { existingIsSuccess?: boolean } = {}): Prom
     console.error(`⚠️  Model sync skipped: ${e instanceof Error ? e.message : String(e)}`);
     return null;
   });
-  if (synced?.status === "skipped") console.log("   Codex integration OFF; startup left Codex native.");
+  if (synced?.status === "skipped" && synced.skippedReason === "desired_disabled") {
+    console.log("   Codex integration OFF; startup left Codex native.");
+  } else if (synced?.status === "skipped" && synced.skippedReason === "no_config") {
+    console.log(`   ${synced.message}`);
+  }
   // The child opens /healthz before its best-effort roster reconcile. Await the same idempotent
   // operation in the parent so `ocx ensure` cannot report success while stale ocx-*.md files are
   // still observable. Always use the live port, including fallback-port starts.

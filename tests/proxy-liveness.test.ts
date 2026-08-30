@@ -489,7 +489,7 @@ describe("runStartupReadinessSync", () => {
 
   test("ok=true with nonempty warning → failed", async () => {
     const gate = createReadinessGate();
-    await runStartupReadinessSync(gate, async () => ({ ok: true, warning: "catalog sync skipped: no source" }));
+    await runStartupReadinessSync(gate, async () => ({ ok: true, warning: "catalog refresh failed" }));
     expect(gate.getStatus()).toBe("failed");
   });
 

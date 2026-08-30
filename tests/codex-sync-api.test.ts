@@ -2,12 +2,18 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { syncModelsToCodex } from "../src/codex/sync";
+import { delimiter, join } from "node:path";
+import {
+  NO_CODEX_CATALOG_SOURCE_MESSAGE,
+  UNREADABLE_CODEX_CATALOG_SOURCE_MESSAGE,
+  syncAppliedCodexConfig,
+  syncModelsToCodex,
+} from "../src/codex/sync";
 import { MANAGED_AGENTS_TABLE_MARKER, MANAGED_SUBAGENT_DEFAULT_MARKER } from "../src/codex/subagent-defaults";
 import type { OcxConfig } from "../src/types";
 import type { OrcaCodexHomeDiagnostic } from "../src/codex/home";
 import { claimOwnedServiceHome, withOwnedServiceHomePreload } from "./helpers/owned-service-home";
+import { SPAWN_BUDGET_MS } from "./helpers/test-budget";
 
 const TEST_DIR = join(import.meta.dir, ".tmp-codex-sync-api");
 const TEST_CODEX_HOME = join(TEST_DIR, "codex");
@@ -65,6 +71,15 @@ function homeDiagnostic(overrides: Partial<OrcaCodexHomeDiagnostic> = {}): OrcaC
 }
 
 describe("GUI/CLI Codex sync backend", () => {
+  test("CodexSyncResult documents skipped as zero-write and catalog-only as not injection", () => {
+    const source = readFileSync(new URL("../src/codex/sync.ts", import.meta.url), "utf8");
+    expect(source).not.toMatch(/skipped` is policy truth/);
+    expect(source).toContain("`no_config` is");
+    expect(source).toContain("environmental");
+    expect(source).toContain("final-injection disappearance race");
+    expect(source).toContain("catalog refresh wrote Codex artifacts");
+  });
+
   beforeEach(() => {
     prevCodexHome = process.env.CODEX_HOME;
     prevOpenCodexHome = process.env.OPENCODEX_HOME;
@@ -136,6 +151,572 @@ describe("GUI/CLI Codex sync backend", () => {
     expect(logs).toContain("   Target Codex home: C:\\Users\\[USER]\\.codex");
     expect(errors).toEqual([]);
   });
+
+  test("an absent Codex catalog source is diagnostic but does not block startup readiness", async () => {
+    const errors: string[] = [];
+    const result = await syncModelsToCodex(12345, config, {
+      log: () => {},
+      error: line => errors.push(String(line)),
+    }, {
+      admitCodexWrite: admittedSync,
+      refreshCodexModelCatalog: async () => ({
+        added: 0,
+        path: "/tmp/missing-catalog.json",
+        catalogExists: false,
+        catalogWritten: false,
+        cacheSynced: false,
+        comboOmissions: [],
+        skippedReason: "no_source",
+      }),
+      injectCodexConfig: async (_port, _config, options) => {
+        if (options.validateOnly !== true) expect(options.catalogPath).toBeNull();
+        return { success: true, message: "injected without a catalog override" };
+      },
+      currentExternalCodexModelProvider: () => null,
+      collectCodexHomeDiagnostic: () => homeDiagnostic(),
+    });
+
+    expect(result).toMatchObject({
+      status: "applied",
+      ok: true,
+      catalogExists: false,
+      catalogWritten: false,
+      cacheSynced: false,
+    });
+    expect(result).not.toHaveProperty("warning");
+    expect(errors).toContain(NO_CODEX_CATALOG_SOURCE_MESSAGE);
+  });
+
+  test("an unreadable existing Codex catalog source blocks startup readiness", async () => {
+    const errors: string[] = [];
+    const result = await syncModelsToCodex(12345, config, {
+      log: () => {},
+      error: line => errors.push(String(line)),
+    }, {
+      admitCodexWrite: admittedSync,
+      refreshCodexModelCatalog: async () => ({
+        added: 0,
+        path: "/tmp/malformed-catalog.json",
+        catalogExists: true,
+        catalogWritten: false,
+        cacheSynced: false,
+        comboOmissions: [],
+        skippedReason: "unreadable_source",
+      }),
+      injectCodexConfig: async (_port, _config, options) => {
+        if (options.validateOnly !== true) expect(options.catalogPath).toBe("/tmp/malformed-catalog.json");
+        return { success: true, message: "injected despite an unreadable catalog" };
+      },
+      currentExternalCodexModelProvider: () => null,
+      collectCodexHomeDiagnostic: () => homeDiagnostic(),
+    });
+
+    expect(result).toMatchObject({
+      status: "applied",
+      ok: true,
+      catalogExists: true,
+      catalogWritten: false,
+      warning: UNREADABLE_CODEX_CATALOG_SOURCE_MESSAGE,
+    });
+    expect(errors).toContain(UNREADABLE_CODEX_CATALOG_SOURCE_MESSAGE);
+  });
+
+  test("a genuine no_config preflight is a skipped no-op and does not refresh or apply", async () => {
+    const errors: string[] = [];
+    let refreshCalls = 0;
+    let injectCalls = 0;
+    const missing = "Codex config not found at /tmp/codex/config.toml. Is Codex installed?";
+    const result = await syncModelsToCodex(12345, config, {
+      log: () => {},
+      error: line => errors.push(String(line)),
+    }, {
+      admitCodexWrite: admittedSync,
+      refreshCodexModelCatalog: async () => {
+        refreshCalls += 1;
+        throw new Error("catalog refresh must not run for a genuine no_config skip");
+      },
+      injectCodexConfig: async (_port, _config, options) => {
+        injectCalls += 1;
+        expect(options.validateOnly).toBe(true);
+        return {
+          success: true,
+          status: "skipped" as const,
+          skippedReason: "no_config" as const,
+          message: missing,
+        };
+      },
+      currentExternalCodexModelProvider: () => null,
+      collectCodexHomeDiagnostic: () => homeDiagnostic(),
+    });
+
+    expect(injectCalls).toBe(1);
+    expect(refreshCalls).toBe(0);
+    expect(result).toEqual({
+      status: "skipped",
+      skippedReason: "no_config",
+      ok: true,
+      added: 0,
+      catalogPath: null,
+      catalogExists: false,
+      catalogWritten: false,
+      cacheSynced: false,
+      message: missing,
+    });
+    expect(result).not.toHaveProperty("warning");
+    expect(errors).toContain(missing);
+    expect(errors).not.toContain(NO_CODEX_CATALOG_SOURCE_MESSAGE);
+  });
+
+  test("catalogEvenWhenNotInjected still refreshes after a genuine no_config preflight", async () => {
+    let refreshCalls = 0;
+    let injectCalls = 0;
+    const missing = "Codex config not found at /tmp/codex/config.toml. Is Codex installed?";
+    const result = await syncModelsToCodex(12345, config, {
+      log: () => {},
+      error: () => {},
+    }, {
+      admitCodexWrite: admittedSync,
+      refreshCodexModelCatalog: async () => {
+        refreshCalls += 1;
+        return {
+          added: 0,
+          path: "/tmp/missing-catalog.json",
+          catalogExists: false,
+          catalogWritten: false,
+          cacheSynced: false,
+          comboOmissions: [],
+          skippedReason: "no_source",
+        };
+      },
+      injectCodexConfig: async (_port, _config, options) => {
+        injectCalls += 1;
+        expect(options.validateOnly).toBe(true);
+        return {
+          success: true,
+          status: "skipped" as const,
+          skippedReason: "no_config" as const,
+          message: missing,
+        };
+      },
+      currentExternalCodexModelProvider: () => null,
+      collectCodexHomeDiagnostic: () => homeDiagnostic(),
+    }, { catalogEvenWhenNotInjected: true });
+
+    expect(injectCalls).toBe(1);
+    expect(refreshCalls).toBe(1);
+    expect(result).toMatchObject({
+      status: "catalog-only",
+      ok: true,
+      catalogWritten: false,
+      cacheSynced: false,
+    });
+    expect(result).not.toHaveProperty("skippedReason");
+  });
+
+  test("a disappearing config after catalog write returns catalog-only with write flags", async () => {
+    let injectCalls = 0;
+    const errors: string[] = [];
+    const gone = "Codex config not found at /tmp/codex/config.toml. Is Codex installed?";
+    const result = await syncModelsToCodex(12345, config, {
+      log: () => {},
+      error: line => errors.push(String(line)),
+    }, {
+      admitCodexWrite: admittedSync,
+      refreshCodexModelCatalog: async () => ({
+        added: 2,
+        path: "/tmp/catalog.json",
+        catalogExists: true,
+        catalogWritten: true,
+        cacheSynced: true,
+        comboOmissions: [],
+      }),
+      injectCodexConfig: async (_port, _config, options) => {
+        injectCalls += 1;
+        if (options.validateOnly === true) {
+          return { success: true, message: "preflight passed" };
+        }
+        return {
+          success: true,
+          status: "skipped" as const,
+          skippedReason: "no_config" as const,
+          message: gone,
+        };
+      },
+      currentExternalCodexModelProvider: () => null,
+      collectCodexHomeDiagnostic: () => homeDiagnostic(),
+    });
+
+    expect(injectCalls).toBe(2);
+    expect(result).toMatchObject({
+      status: "catalog-only",
+      ok: true,
+      added: 2,
+      catalogPath: "/tmp/catalog.json",
+      catalogExists: true,
+      catalogWritten: true,
+      cacheSynced: true,
+    });
+    expect(result).not.toHaveProperty("skippedReason");
+    expect(result).not.toHaveProperty("warning");
+    expect(syncAppliedCodexConfig(result)).toBe(false);
+    expect(errors).toContain(gone);
+    expect(result.message).toBe(
+      "Codex config disappeared during catalog refresh; catalog refresh wrote Codex artifacts, Codex config untouched.",
+    );
+    expect(result.message).not.toContain("catalog and models cache were written");
+  });
+
+  test("a disappearing config after a catalog-only write does not claim the cache was written", async () => {
+    const gone = "Codex config not found at /tmp/codex/config.toml. Is Codex installed?";
+    const result = await syncModelsToCodex(12345, config, { log: () => {}, error: () => {} }, {
+      admitCodexWrite: admittedSync,
+      refreshCodexModelCatalog: async () => ({
+        added: 1,
+        path: "/tmp/catalog.json",
+        catalogExists: true,
+        catalogWritten: true,
+        cacheSynced: false,
+        comboOmissions: [],
+      }),
+      injectCodexConfig: async (_port, _config, options) => {
+        if (options.validateOnly === true) return { success: true, message: "preflight passed" };
+        return {
+          success: true,
+          status: "skipped" as const,
+          skippedReason: "no_config" as const,
+          message: gone,
+        };
+      },
+      currentExternalCodexModelProvider: () => null,
+      collectCodexHomeDiagnostic: () => homeDiagnostic(),
+    });
+
+    expect(result).toMatchObject({
+      status: "catalog-only",
+      ok: true,
+      catalogWritten: true,
+      cacheSynced: false,
+    });
+    expect(result.message).toBe(
+      "Codex config disappeared during catalog refresh; catalog refresh wrote Codex artifacts, Codex config untouched.",
+    );
+    expect(result.message).not.toContain("models cache were written");
+  });
+
+  test("a disappearing config after a cache-only write does not claim the catalog was written", async () => {
+    const gone = "Codex config not found at /tmp/codex/config.toml. Is Codex installed?";
+    const result = await syncModelsToCodex(12345, config, { log: () => {}, error: () => {} }, {
+      admitCodexWrite: admittedSync,
+      refreshCodexModelCatalog: async () => ({
+        added: 0,
+        path: "/tmp/catalog.json",
+        catalogExists: true,
+        catalogWritten: false,
+        cacheSynced: true,
+        comboOmissions: [],
+      }),
+      injectCodexConfig: async (_port, _config, options) => {
+        if (options.validateOnly === true) return { success: true, message: "preflight passed" };
+        return {
+          success: true,
+          status: "skipped" as const,
+          skippedReason: "no_config" as const,
+          message: gone,
+        };
+      },
+      currentExternalCodexModelProvider: () => null,
+      collectCodexHomeDiagnostic: () => homeDiagnostic(),
+    });
+
+    expect(result).toMatchObject({
+      status: "catalog-only",
+      ok: true,
+      catalogWritten: false,
+      cacheSynced: true,
+    });
+    expect(result.message).toBe(
+      "Codex config disappeared during catalog refresh; catalog refresh wrote Codex artifacts, Codex config untouched.",
+    );
+    expect(result.message).not.toContain("catalog and models cache were written");
+  });
+
+  test("a disappearing config after catalog diagnosis preserves warning evidence", async () => {
+    const gone = "Codex config not found at /tmp/codex/config.toml. Is Codex installed?";
+    const result = await syncModelsToCodex(12345, config, {
+      log: () => {},
+      error: () => {},
+    }, {
+      admitCodexWrite: admittedSync,
+      refreshCodexModelCatalog: async () => ({
+        added: 0,
+        path: "/tmp/catalog.json",
+        catalogExists: true,
+        catalogWritten: false,
+        cacheSynced: false,
+        comboOmissions: [],
+        skippedReason: "unreadable_source",
+      }),
+      injectCodexConfig: async (_port, _config, options) => {
+        if (options.validateOnly === true) {
+          return { success: true, message: "preflight passed" };
+        }
+        return {
+          success: true,
+          status: "skipped" as const,
+          skippedReason: "no_config" as const,
+          message: gone,
+        };
+      },
+      currentExternalCodexModelProvider: () => null,
+      collectCodexHomeDiagnostic: () => homeDiagnostic(),
+    });
+
+    expect(result).toMatchObject({
+      status: "catalog-only",
+      ok: true,
+      added: 0,
+      catalogPath: "/tmp/catalog.json",
+      catalogExists: true,
+      catalogWritten: false,
+      cacheSynced: false,
+      warning: UNREADABLE_CODEX_CATALOG_SOURCE_MESSAGE,
+    });
+    expect(result).not.toHaveProperty("skippedReason");
+    expect(syncAppliedCodexConfig(result)).toBe(false);
+  });
+
+  test("a fresh empty Codex home with no Codex CLI is ready for /readyz", () => {
+    const root = mkdtempSync(join(tmpdir(), "ocx-empty-codex-sync-"));
+    const codexHome = join(root, "codex");
+    const ocxHome = join(root, "ocx");
+    const home = join(root, "home");
+    mkdirSync(codexHome, { recursive: true });
+    mkdirSync(ocxHome, { recursive: true });
+    mkdirSync(home, { recursive: true });
+    writeFileSync(join(ocxHome, "config.json"), JSON.stringify(config));
+    claimTempHome(codexHome, ocxHome, home);
+    const emptyBin = join(ocxHome, "empty-bin");
+    mkdirSync(emptyBin, { recursive: true });
+    const serviceBins = (serviceManagerEnv.PATH ?? "")
+      .split(delimiter)
+      .filter(dir => dir.includes(".ocx-test-bin"));
+    try {
+      const child = spawnSync(process.execPath, childArgs(["--eval", `
+        const { syncModelsToCodex } = require("./src/codex/sync");
+        const { createReadinessGate, runStartupReadinessSync } = require("./src/server/readiness");
+        const { loadConfig } = require("./src/config");
+        (async () => {
+          const gate = createReadinessGate();
+          const errors = [];
+          const outcome = await runStartupReadinessSync(gate, () => syncModelsToCodex(10100, loadConfig(), {
+            log() {},
+            error(line) { errors.push(String(line)); },
+          }));
+          const { existsSync } = require("node:fs");
+          const { join } = require("node:path");
+          console.log(JSON.stringify({
+            ok: outcome?.ok === true,
+            warning: outcome && "warning" in outcome ? outcome.warning : null,
+            catalogExists: outcome?.catalogExists ?? null,
+            syncStatus: outcome && "status" in outcome ? outcome.status : null,
+            skippedReason: outcome && "skippedReason" in outcome ? outcome.skippedReason : null,
+            message: typeof outcome?.message === "string" ? outcome.message : null,
+            status: gate.getStatus(),
+            errors,
+            configToml: existsSync(join(process.env.CODEX_HOME, "config.toml")),
+            catalog: existsSync(join(process.env.CODEX_HOME, "opencodex-catalog.json")),
+            cache: existsSync(join(process.env.CODEX_HOME, "models_cache.json")),
+            history: existsSync(join(process.env.CODEX_HOME, "history.jsonl")),
+            journal: existsSync(join(process.env.CODEX_HOME, "opencodex-journal.json")),
+          }));
+        })();
+      `]), {
+        cwd: repoRoot,
+        env: childEnv({
+          HOME: home,
+          USERPROFILE: home,
+          CODEX_HOME: codexHome,
+          OPENCODEX_HOME: ocxHome,
+          PATH: [...serviceBins, emptyBin].join(delimiter) || emptyBin,
+          CODEX_CLI_PATH: "",
+        }),
+        encoding: "utf8",
+        timeout: SPAWN_BUDGET_MS - 5_000,
+      });
+      expect(child.status).toBe(0);
+      const payload = JSON.parse(child.stdout.trim().split("\n").filter(Boolean).pop() ?? "{}") as {
+        ok: boolean;
+        warning: string | null;
+        catalogExists: boolean | null;
+        syncStatus: string | null;
+        skippedReason: string | null;
+        message: string | null;
+        status: string;
+        errors: string[];
+        configToml: boolean;
+        catalog: boolean;
+        cache: boolean;
+        history: boolean;
+        journal: boolean;
+      };
+      expect(payload).toMatchObject({
+        ok: true,
+        warning: null,
+        catalogExists: false,
+        syncStatus: "skipped",
+        skippedReason: "no_config",
+        status: "ready",
+        configToml: false,
+        catalog: false,
+        cache: false,
+        history: false,
+        journal: false,
+      });
+      expect(payload.message).toContain("Is Codex installed?");
+      expect(payload.errors.some(line => line.includes("Is Codex installed?"))).toBe(true);
+      expect(payload.errors).not.toContain(NO_CODEX_CATALOG_SOURCE_MESSAGE);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, SPAWN_BUDGET_MS);
+
+  test("a directory at config.toml is not no_config and fails readiness", () => {
+    const root = mkdtempSync(join(tmpdir(), "ocx-dir-config-sync-"));
+    const codexHome = join(root, "codex");
+    const ocxHome = join(root, "ocx");
+    const home = join(root, "home");
+    mkdirSync(codexHome, { recursive: true });
+    mkdirSync(ocxHome, { recursive: true });
+    mkdirSync(home, { recursive: true });
+    mkdirSync(join(codexHome, "config.toml"));
+    writeFileSync(join(ocxHome, "config.json"), JSON.stringify(config));
+    claimTempHome(codexHome, ocxHome, home);
+    const emptyBin = join(ocxHome, "empty-bin");
+    mkdirSync(emptyBin, { recursive: true });
+    const serviceBins = (serviceManagerEnv.PATH ?? "")
+      .split(delimiter)
+      .filter(dir => dir.includes(".ocx-test-bin"));
+    try {
+      const child = spawnSync(process.execPath, childArgs(["--eval", `
+        const { syncModelsToCodex } = require("./src/codex/sync");
+        const { createReadinessGate, runStartupReadinessSync } = require("./src/server/readiness");
+        const { loadConfig } = require("./src/config");
+        (async () => {
+          const gate = createReadinessGate();
+          let thrown = null;
+          const outcome = await runStartupReadinessSync(gate, async () => {
+            try {
+              return await syncModelsToCodex(10100, loadConfig(), { log() {}, error() {} });
+            } catch (error) {
+              thrown = error instanceof Error ? error.message : String(error);
+              throw error;
+            }
+          });
+          console.log(JSON.stringify({
+            ok: outcome?.ok === true,
+            syncStatus: outcome && "status" in outcome ? outcome.status : null,
+            skippedReason: outcome && "skippedReason" in outcome ? outcome.skippedReason : null,
+            message: typeof outcome?.message === "string" ? outcome.message : null,
+            status: gate.getStatus(),
+            thrown,
+          }));
+        })();
+      `]), {
+        cwd: repoRoot,
+        env: childEnv({
+          HOME: home,
+          USERPROFILE: home,
+          CODEX_HOME: codexHome,
+          OPENCODEX_HOME: ocxHome,
+          PATH: [...serviceBins, emptyBin].join(delimiter) || emptyBin,
+          CODEX_CLI_PATH: "",
+        }),
+        encoding: "utf8",
+        timeout: SPAWN_BUDGET_MS - 5_000,
+      });
+      expect(child.status).toBe(0);
+      const payload = JSON.parse(child.stdout.trim().split("\n").filter(Boolean).pop() ?? "{}") as {
+        ok: boolean;
+        syncStatus: string | null;
+        skippedReason: string | null;
+        message: string | null;
+        status: string;
+        thrown: string | null;
+      };
+      expect(payload.status).toBe("failed");
+      expect(payload.ok).toBe(false);
+      expect(payload.skippedReason).not.toBe("no_config");
+      expect(payload.syncStatus).not.toBe("skipped");
+      expect(
+        payload.message?.includes("not a usable regular file")
+        || payload.thrown?.includes("config.toml"),
+      ).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, SPAWN_BUDGET_MS);
+
+  test("a malformed existing Codex catalog still fails readiness when Codex CLI is absent", () => {
+    const root = mkdtempSync(join(tmpdir(), "ocx-bad-catalog-sync-"));
+    const codexHome = join(root, "codex");
+    const ocxHome = join(root, "ocx");
+    const home = join(root, "home");
+    mkdirSync(codexHome, { recursive: true });
+    mkdirSync(ocxHome, { recursive: true });
+    mkdirSync(home, { recursive: true });
+    writeFileSync(join(ocxHome, "config.json"), JSON.stringify(config));
+    writeFileSync(join(codexHome, "config.toml"), 'model = "gpt-5.5"\n', "utf8");
+    writeFileSync(join(codexHome, "opencodex-catalog.json"), "{not-json", "utf8");
+    claimTempHome(codexHome, ocxHome, home);
+    const emptyBin = join(ocxHome, "empty-bin");
+    mkdirSync(emptyBin, { recursive: true });
+    const serviceBins = (serviceManagerEnv.PATH ?? "")
+      .split(delimiter)
+      .filter(dir => dir.includes(".ocx-test-bin"));
+    try {
+      const child = spawnSync(process.execPath, childArgs(["--eval", `
+        const { syncModelsToCodex, UNREADABLE_CODEX_CATALOG_SOURCE_MESSAGE } = require("./src/codex/sync");
+        const { createReadinessGate, runStartupReadinessSync } = require("./src/server/readiness");
+        const { loadConfig } = require("./src/config");
+        (async () => {
+          const gate = createReadinessGate();
+          const outcome = await runStartupReadinessSync(gate, () => syncModelsToCodex(10100, loadConfig(), {
+            log() {},
+            error() {},
+          }));
+          console.log(JSON.stringify({
+            ok: outcome?.ok === true,
+            warning: outcome && "warning" in outcome ? outcome.warning : null,
+            expected: UNREADABLE_CODEX_CATALOG_SOURCE_MESSAGE,
+            status: gate.getStatus(),
+          }));
+        })();
+      `]), {
+        cwd: repoRoot,
+        env: childEnv({
+          HOME: home,
+          USERPROFILE: home,
+          CODEX_HOME: codexHome,
+          OPENCODEX_HOME: ocxHome,
+          PATH: [...serviceBins, emptyBin].join(delimiter) || emptyBin,
+          CODEX_CLI_PATH: "",
+        }),
+        encoding: "utf8",
+        timeout: SPAWN_BUDGET_MS - 5_000,
+      });
+      expect(child.status).toBe(0);
+      const payload = JSON.parse(child.stdout.trim().split("\n").filter(Boolean).pop() ?? "{}") as {
+        ok: boolean;
+        warning: string | null;
+        expected: string;
+        status: string;
+      };
+      expect(payload.warning).toBe(payload.expected);
+      expect(payload.status).toBe("failed");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, SPAWN_BUDGET_MS);
 
   test("refuses during injection preflight before catalog or cache mutation", async () => {
     let refreshCalls = 0;

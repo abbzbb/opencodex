@@ -9,15 +9,25 @@ import { shouldSyncCodexOnStart } from "./desired-state";
 import { admitCodexWrite, type CodexAdmission } from "./admission";
 import type { CodexCatalogSyncOptions } from "./catalog/sync";
 
+export const NO_CODEX_CATALOG_SOURCE_MESSAGE =
+  "catalog sync skipped: no Codex catalog source found; keeping Codex's native catalog.";
+export const UNREADABLE_CODEX_CATALOG_SOURCE_MESSAGE =
+  "catalog sync skipped: existing Codex catalog source is unreadable; leaving it unchanged.";
+
 export interface CodexSyncResult {
   /**
-   * `skipped` is policy truth, never evidence that Codex was written.
-   * `catalog-only` means an explicit sync refreshed the catalog/cache while
-   * Codex injection stayed OFF; config and history were not touched.
+   * `skipped` is a zero-write outcome, never evidence that Codex was written.
+   * `desired_disabled` is the durable OFF switch (policy). `no_config` is
+   * environmental: a proven-absent config/injection target (ENOENT/ENOTDIR on
+   * config.toml). `catalog-only` means config and history were not injected.
+   * That includes explicit catalog-only syncs (`catalogEvenWhenNotInjected`)
+   * and a final-injection disappearance race after catalog refresh already
+   * wrote or diagnosed. `catalogWritten` / `cacheSynced` / `added` are the
+   * write evidence; they are not implied by `status`.
    */
   status: "applied" | "skipped" | "catalog-only" | "refused";
   ok: boolean;
-  skippedReason?: "desired_disabled";
+  skippedReason?: "desired_disabled" | "no_config";
   /** Present when unattended convergence refused another service's native home. */
   authority?: "service-home";
   added: number;
@@ -60,6 +70,58 @@ const defaultDeps: CodexSyncDeps = {
   injectCodexConfig,
 };
 
+function isExpectedAbsentCodexConfig(result: {
+  success: boolean;
+  status?: string;
+  skippedReason?: string;
+}): boolean {
+  return result.status === "skipped" && result.skippedReason === "no_config" && result.success === true;
+}
+
+/** True only when Codex config/history injection actually applied. */
+export function syncAppliedCodexConfig(result: CodexSyncResult | null | undefined): boolean {
+  return result?.status === "applied" && result.ok === true;
+}
+
+function catalogRefreshStatusPhrase(catalogWritten: boolean, cacheSynced: boolean): string {
+  return catalogWritten || cacheSynced
+    ? "catalog refresh wrote Codex artifacts"
+    : "catalog refresh skipped";
+}
+
+function skippedSyncResult(
+  skippedReason: "desired_disabled" | "no_config",
+  message: string,
+): CodexSyncResult {
+  return {
+    status: "skipped",
+    skippedReason,
+    ok: true,
+    added: 0,
+    catalogPath: null,
+    catalogExists: false,
+    catalogWritten: false,
+    cacheSynced: false,
+    message,
+  };
+}
+
+function noteCatalogSourceAbsence(
+  cat: { added: number; catalogExists: boolean; skippedReason?: string },
+  log: Pick<Console, "log" | "error"> | null,
+): string | undefined {
+  if (cat.added > 0) return undefined;
+  if (cat.skippedReason === "unreadable_source") {
+    log?.error(UNREADABLE_CODEX_CATALOG_SOURCE_MESSAGE);
+    return UNREADABLE_CODEX_CATALOG_SOURCE_MESSAGE;
+  }
+  if (!cat.catalogExists) {
+    log?.error(NO_CODEX_CATALOG_SOURCE_MESSAGE);
+    if (cat.skippedReason !== "no_source") return NO_CODEX_CATALOG_SOURCE_MESSAGE;
+  }
+  return undefined;
+}
+
 function reportCodexHomeTarget(
   log: Pick<Console, "log" | "error"> | null,
   collectDiagnostic: typeof collectOrcaCodexHomeDiagnostic,
@@ -87,17 +149,10 @@ export async function syncModelsToCodex(
   const desiredDisabled = !shouldSyncCodexOnStart(loadConfig());
   const catalogEvenWhenNotInjected = options.catalogEvenWhenNotInjected === true;
   if (desiredDisabled && !catalogEvenWhenNotInjected) {
-    return {
-      status: "skipped",
-      skippedReason: "desired_disabled",
-      ok: true,
-      added: 0,
-      catalogPath: null,
-      catalogExists: false,
-      catalogWritten: false,
-      cacheSynced: false,
-      message: "Codex integration is OFF; no Codex config, catalog, cache, or history was changed.",
-    };
+    return skippedSyncResult(
+      "desired_disabled",
+      "Codex integration is OFF; no Codex config, catalog, cache, or history was changed.",
+    );
   }
   // Catalog gathering precedes injection and can itself write the native
   // catalog/cache. It therefore needs the same unattended service-home veto as
@@ -125,9 +180,7 @@ export async function syncModelsToCodex(
     // never touch config, journal, or history.
     applyProxyEnv(config);
     const refreshed = await refreshCatalogForSync(config, deps, { allowWhenDesiredDisabled: true }, log);
-    const message = refreshed.catalogWritten || refreshed.cacheSynced
-      ? "Codex integration is OFF; catalog and models cache refreshed, Codex config untouched."
-      : "Codex integration is OFF; catalog refresh skipped, Codex config untouched.";
+    const message = `Codex integration is OFF; ${catalogRefreshStatusPhrase(refreshed.catalogWritten, refreshed.cacheSynced)}, Codex config untouched.`;
     return {
       status: "catalog-only",
       ok: true,
@@ -145,9 +198,7 @@ export async function syncModelsToCodex(
       // return without injection.
       applyProxyEnv(config);
       const refreshed = await refreshCatalogForSync(config, deps, undefined, log);
-      const message = refreshed.catalogWritten || refreshed.cacheSynced
-        ? "External provider owns config.toml; catalog and models cache refreshed, Codex config/journal untouched."
-        : "External provider owns config.toml; catalog refresh skipped, Codex config/journal untouched.";
+      const message = `External provider owns config.toml; ${catalogRefreshStatusPhrase(refreshed.catalogWritten, refreshed.cacheSynced)}, Codex config/journal untouched.`;
       return {
         status: "catalog-only",
         ok: true,
@@ -178,6 +229,27 @@ export async function syncModelsToCodex(
   // coordination eligibility before catalog gathering: a known-bad config must not turn a
   // working catalog/cache into the partial result of an otherwise unnecessary refresh.
   const preflight = await deps.injectCodexConfig(p, config, { validateOnly: true });
+  if (isExpectedAbsentCodexConfig(preflight)) {
+    // Proven absent config/injection target. Catalog/cache refresh is a write
+    // path, so the ordinary startup/sync must not continue into it. Explicit
+    // catalog-only callers already took the dedicated branch above, except
+    // `catalogEvenWhenNotInjected` with injection still ON.
+    log?.error(preflight.message);
+    reportCodexHomeTarget(log, deps.collectCodexHomeDiagnostic ?? collectOrcaCodexHomeDiagnostic);
+    if (!catalogEvenWhenNotInjected) {
+      return skippedSyncResult("no_config", preflight.message);
+    }
+    applyProxyEnv(config);
+    const refreshed = await refreshCatalogForSync(config, deps, undefined, log);
+    const message = `Codex config is absent; ${catalogRefreshStatusPhrase(refreshed.catalogWritten, refreshed.cacheSynced)}, Codex config untouched.`;
+    return {
+      status: "catalog-only",
+      ok: true,
+      ...refreshed,
+      message,
+      ...(refreshed.comboOmissions.length > 0 ? { comboOmissions: refreshed.comboOmissions } : {}),
+    };
+  }
   if (!preflight.success) {
     log?.error(preflight.message);
     reportCodexHomeTarget(log, deps.collectCodexHomeDiagnostic ?? collectOrcaCodexHomeDiagnostic);
@@ -217,9 +289,8 @@ export async function syncModelsToCodex(
     comboOmissions = cat.comboOmissions ?? [];
     if (cat.added > 0) {
       log?.log(`   + ${cat.added} models appended to Codex catalog (${cat.path})`);
-    } else if (!cat.catalogExists) {
-      warning = "catalog sync skipped: no Codex catalog source found; keeping Codex's native catalog.";
-      log?.error(warning);
+    } else {
+      warning = noteCatalogSourceAbsence(cat, log);
     }
     if (comboOmissions.length > 0) {
       // Individual omission lines already went through console.warn during gather;
@@ -235,18 +306,34 @@ export async function syncModelsToCodex(
 
   const result = await deps.injectCodexConfig(p, config, { catalogPath: catalogPathForInjection });
   if (result.status === "skipped") {
-    return {
-      status: "skipped",
-      // The apply direction's only under-lock policy skip is desired OFF.
-      skippedReason: "desired_disabled",
-      ok: true,
-      added: 0,
-      catalogPath: null,
-      catalogExists: false,
-      catalogWritten: false,
-      cacheSynced: false,
-      message: result.message,
-    };
+    if (result.skippedReason === "no_config"
+      && (catalogWritten || cacheSynced || added > 0 || warning !== undefined || comboOmissions.length > 0)) {
+      // Preflight saw a config, refresh wrote or diagnosed, then the
+      // config/injection target vanished. Keep the refresh evidence so stale
+      // app-servers still restart and /readyz still sees an unreadable-source
+      // warning.
+      log?.error(result.message);
+      reportCodexHomeTarget(log, deps.collectCodexHomeDiagnostic ?? collectOrcaCodexHomeDiagnostic);
+      const message = catalogWritten || cacheSynced
+        ? `Codex config disappeared during catalog refresh; ${catalogRefreshStatusPhrase(catalogWritten, cacheSynced)}, Codex config untouched.`
+        : result.message;
+      return {
+        status: "catalog-only",
+        ok: true,
+        added,
+        catalogPath,
+        catalogExists,
+        catalogWritten,
+        cacheSynced,
+        message,
+        ...(warning ? { warning } : {}),
+        ...(comboOmissions.length > 0 ? { comboOmissions } : {}),
+      };
+    }
+    return skippedSyncResult(
+      result.skippedReason === "no_config" ? "no_config" : "desired_disabled",
+      result.message,
+    );
   }
   if (result.success) log?.log(result.message);
   else log?.error(result.message);
@@ -302,9 +389,8 @@ async function refreshCatalogForSync(
     comboOmissions = cat.comboOmissions ?? [];
     if (cat.added > 0) {
       log?.log(`   + ${cat.added} models appended to Codex catalog (${cat.path})`);
-    } else if (!cat.catalogExists) {
-      warning = "catalog sync skipped: no Codex catalog source found; keeping Codex's native catalog.";
-      log?.error(warning);
+    } else {
+      warning = noteCatalogSourceAbsence(cat, log);
     }
     if (comboOmissions.length > 0) {
       const summary = summarizeComboCatalogOmissions(comboOmissions);

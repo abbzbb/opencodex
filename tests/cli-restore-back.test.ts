@@ -104,7 +104,7 @@ describe("ocx restore back", () => {
       // (CI has no Codex catalog source). The durable policy invariant is the same in
       // both: Codex config is untouched (mtime asserted below).
       const combined = `${result.stdout}\n${result.stderr}`;
-      expect(combined).toMatch(/Codex integration is OFF; catalog (and models cache refreshed|refresh skipped), Codex config untouched\./);
+      expect(combined).toMatch(/Codex integration is OFF; catalog refresh (wrote Codex artifacts|skipped), Codex config untouched\./);
       expect(statSync(configPath).mtimeMs).toBe(before);
     } finally {
       rmSync(codexHome, { recursive: true, force: true });
@@ -160,6 +160,12 @@ describe("ocx restore back", () => {
       rmSync(codexHome, { recursive: true, force: true });
       rmSync(ocxHome, { recursive: true, force: true });
     }
+  });
+
+  test("restore back claims success only after applied Codex injection", () => {
+    const source = readFileSync(join(repoRoot, "src/cli/dispatch.ts"), "utf8");
+    expect(source).toContain("syncAppliedCodexConfig");
+    expect(source).toMatch(/restoreArgs\[0\] === "back"[\s\S]*if \(!syncAppliedCodexConfig\(synced\)\)/);
   });
 
   test("help documents both directions of the switch", () => {

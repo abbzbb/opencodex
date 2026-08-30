@@ -97,6 +97,12 @@ bun desktop/scripts/validate-packaging.ts --require-real \
 bun desktop/scripts/probe-linux-deb.ts \
   --deb desktop/src-tauri/target/release/bundle/deb/OpenCodex_2.36.0_amd64.deb \
   --sha256 <trusted-lowercase-sha256>
+
+# Real dpkg install in a pinned Debian 13 container. Proves desktop-direct
+# /readyz and structured stop. Does not prove WebView/session/CSRF/navigation.
+bun desktop/scripts/probe-linux-deb-postinstall.ts \
+  --deb desktop/src-tauri/target/release/bundle/deb/OpenCodex_2.36.0_amd64.deb \
+  --sha256 <trusted-lowercase-sha256>
 ```
 
 Do not run the repository-wide `bun run test` for desktop-only runtime/staging
@@ -126,18 +132,26 @@ work.
 
 ## Platform smoke gaps
 
-The full PLAN §9.2 install-time smokes have not been run. The Linux x64 Debian
-pre-install probe now verifies the exact extracted resource layout, stable
-runtime publication/reuse, stopped bridge load, and target-native keyring load:
-[`phase1-linux-deb-resource-layout.md`](./probes/phase1-linux-deb-resource-layout.md).
-It does not count as an installed App, `/readyz`, or WebView smoke.
+The full PLAN §9.2 install-time smokes have not been run. Linux x64 Debian now
+has two probes:
+
+- Extracted layout / stopped stable `status`:
+  [`phase1-linux-deb-resource-layout.md`](./probes/phase1-linux-deb-resource-layout.md)
+- Real `dpkg` install, App launch, `desktop-direct` `/readyz`, structured stop,
+  package removal:
+  [`phase1-linux-deb-postinstall.md`](./probes/phase1-linux-deb-postinstall.md)
+
+Neither probe is WebView, session/CSRF, or navigation evidence. The post-install
+probe directly asserted no Codex CLI and checked the full `current.json`
+identity plus uninstall (resource tree gone and package not installed).
+`/readyz` used the proven-absent `config.toml` no-op.
 
 Explicit gaps:
 
 | Gap | Platforms |
 |---|---|
-| Clean machine without Node/Bun/npm/global `ocx` | macOS arm64/x64, Windows x64, Linux x64 `.deb` |
-| Installed App resource layout → stable runtime → `src/cli/index.ts start` → `/readyz` | all first-ship targets; Linux x64 has only the extracted-layout → stable `status` preflight |
+| Clean machine without Node/Bun/npm/global `ocx` | macOS arm64/x64, Windows x64; Linux x64 `.deb` passed in Debian 13 Docker |
+| Installed App resource layout → stable runtime → `src/cli/index.ts start` → `/readyz` | macOS/Windows still open; Linux x64 `.deb` passed post-install `/readyz` without WebView |
 | Target-native module load (no host-arch stand-in) | macOS arm64/x64 and Windows x64; Linux x64 passed from the extracted `.deb` stable generation |
 | Session bootstrap, CSRF write, 6-minute hide/reopen renewal | all first-ship WebViews |
 | Exact-origin navigation + system-browser handoff | all first-ship WebViews |

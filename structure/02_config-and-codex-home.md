@@ -17,6 +17,30 @@ $CODEX_HOME/models_cache.json
 $CODEX_HOME/.opencodex-native-main-profiles/
 ```
 
+When Codex integration is ON, startup still runs `syncModelsToCodex`. A **proven absence** of
+`$CODEX_HOME/config.toml` — `lstat` ENOENT or ENOTDIR, with no lexical entry — is a successful
+no-op: the result is `status: "skipped"` / `skippedReason: "no_config"`, nothing creates
+`config.toml`, and catalog/cache/history are not refreshed. `/readyz` becomes ready. Explicit
+catalog-only callers (`catalogEvenWhenNotInjected`, `ocx sync`) may still refresh the catalog.
+
+A lexical entry that is not a usable regular file remains blocking: a directory, fifo, permission
+or other stat failure, a dangling symlink, or a symlink whose followed target is not a regular
+file. Those are not `no_config`. A valid symlink to a regular file is a present
+config/injection target; injection reads through it and `atomicWriteFile` keeps the
+shared symlink-preserving rename. The catalog skip uses the same proven-absence rule
+across the active catalog, hashed/legacy backups,
+and models cache. Only a miss on every candidate is `no_source`. Present-but-unreadable artifacts,
+including dangling catalog symlinks and malformed JSON, are `unreadable_source` and fail `/readyz`.
+Valid catalog symlinks keep `readCatalog` follow semantics.
+
+[Decision Log]
+- 목적과 의도: Let a Desktop or CLI proxy become `/readyz` ready when `$CODEX_HOME/config.toml` is a proven-absent config/injection target, without treating unreadable or unsafe `config.toml`/catalog paths as a clean miss.
+- 기존 구현 및 제약 조건: Missing `config.toml` failed injection and `/readyz`; `existsSync` also collapsed EACCES into absence; the shared atomic writer already preserves valid symlink destinations.
+- 검토한 주요 대안: Force Codex integration off, create a native `config.toml`, reject every symlink, or skip only after a fail-closed lstat/stat classification.
+- 선택한 방식: Skip writes only for proven ENOENT/ENOTDIR with no lexical entry; follow a symlink whose target is a regular file; fail closed on dangling/unsafe/unreadable sources.
+- 다른 대안 대신 이 방식을 선택한 이유: Creating Codex files or weakening `/readyz` would change a native home; rejecting valid symlinks would break the atomic-write contract already covered by config tests.
+- 장점, 단점 및 영향: Empty Codex homes start ready; malformed, directory, permission, and dangling-link artifacts still block; dotfiles-managed `config.toml` and catalog links keep working.
+
 Never assume macOS-only paths. Windows, service installs, and app-launched Codex can all depend on
 the resolved `CODEX_HOME`.
 

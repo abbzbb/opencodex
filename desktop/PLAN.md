@@ -299,7 +299,7 @@ bridge 只有在以下证据全部一致时才认定 `desktop-direct`：PID 通�
 
 ### 第 1 期：功能 MVP 窗口与托盘
 
-当前进度（2026-08-30）：Tauri 工程、共享 start/stop/owner seam、v1 bridge、窗口/托盘/single-instance 骨架、target-native runtime payload builder，以及 packaged resource 到 per-user stable runtime 的首次启动接线已落地。builder 在目标主机用 Bun `--production --frozen-lockfile --ignore-scripts` 生成闭包，只保留匹配 target 的 Bun/keyring 原生包，最后写入并复验 manifest；release `build.rs` 在没有真实 payload 时拒绝继续。App 启动先通过独立固定 argv 的 `desktop/runtime/install.ts` 校验并部署资源：无 `current` 时原子发布，同版本仅在规范化 manifest 完全一致时复用，已有不同 `current` 时只 stage 候选而不提前切换。中断遗留的临时 staging 树由下一次成功持锁的部署清理；版本树保留到具备 service/PID 所有权证据的更新事务。尚未完成的是真实 WebView/安装产物资源布局 smoke，以及 service/update/deep-link 后续期。
+当前进度（2026-08-30）：Tauri 工程、共享 start/stop/owner seam、v1 bridge、窗口/托盘/single-instance 骨架、target-native runtime payload builder，以及 packaged resource 到 per-user stable runtime 的首次启动接线已落地。builder 在目标主机用 Bun `--production --frozen-lockfile --ignore-scripts` 生成闭包，只保留匹配 target 的 Bun/keyring 原生包，最后写入并复验 manifest；release `build.rs` 在没有真实 payload 时拒绝继续。App 启动先通过独立固定 argv 的 `desktop/runtime/install.ts` 校验并部署资源：无 `current` 时原子发布，同版本仅在规范化 manifest 完全一致时复用，已有不同 `current` 时只 stage 候选而不提前切换。中断遗留的临时 staging 树由下一次成功持锁的部署清理；版本树保留到具备 service/PID 所有权证据的更新事务。Linux x64 `.deb` 已通过解包资源布局探针和真实 `dpkg` 安装后 Probe B（`desktop-direct` + 严格 `/readyz` + structured stop + `dpkg -r`）。尚未完成的是 WebView/session/CSRF/导航 smoke，以及其他平台与 service/update/deep-link 后续期。
 
 工作项：
 
@@ -430,12 +430,21 @@ bun run test
 
 ### 9.2 每个平台的安装后 smoke
 
-Linux x64 已有一个安装前门禁：
-[`phase1-linux-deb-resource-layout.md`](./probes/phase1-linux-deb-resource-layout.md)
-从真实 release `.deb` 解包，验证 Tauri 资源相对路径、双份 runtime 哈希、stable
-首次发布/复用、stable bridge `status` 和 target-native keyring 加载。它不执行
-`dpkg` 安装脚本、不启动代理或 WebView，因此不能替代以下任何安装后 smoke；
-尤其不能把它记为 `/readyz`、session/CSRF 或导航证据。
+Linux x64 已有两个 Debian 探针：
+
+- [`phase1-linux-deb-resource-layout.md`](./probes/phase1-linux-deb-resource-layout.md)
+  从真实 release `.deb` 解包，验证 Tauri 资源相对路径、双份 runtime 哈希、stable
+  首次发布/复用、stable bridge `status` 和 target-native keyring 加载。它不执行
+  `dpkg`、不启动代理或 WebView。
+- [`phase1-linux-deb-postinstall.md`](./probes/phase1-linux-deb-postinstall.md)
+  在 digest-pinned Debian 13 容器中 `dpkg -i` 真实 `.deb`，以 uid 10001 / 零
+  capability / `--network none` 启动 `/usr/bin/opencodex-desktop`，证明
+  `resource_dir()` → stable runtime、`desktop-direct` 所有权、PID/runtime-port/
+  `findLiveProxy` 一致、`/healthz` 与严格 `/readyz`、structured stop 后独立
+  absent，然后 `dpkg -r`。探针直接断言无 Codex CLI，核对完整 `current.json`
+  身份（id/version/target/relPath 且 previous=null），并在卸载后独立确认
+  资源 runtime 路径已消失且包不再 installed。成功 stdout 只有一条 JSON。
+  它不是 WebView、session、CSRF 或导航证据。
 
 1. 干净用户，无 Node/Bun/npm/global ocx。
 2. 安装并冷启动，确认 `/readyz` 后才显示 dashboard。
@@ -456,7 +465,7 @@ Linux x64 已有一个安装前门禁：
 ```text
 0. desktop/README.md：生命周期、所有权、数据目录、限制
 1. Probe A：顶层 WebView + session/CSRF/renewal/navigation
-2. Probe B：target runtime closure + clean-machine launch + /readyz
+2. Probe B：target runtime closure + clean-machine launch + /readyz（Linux x64 `.deb` 已通过安装后探针；WebView 仍缺）
 3. Probe C：stable runtime + service absolute path + rollback
 4. Probe D：single-instance + concurrent external start
 5. Tauri MVP：bridge、窗口、三平台 tray、stop transaction

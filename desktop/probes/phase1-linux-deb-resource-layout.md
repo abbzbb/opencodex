@@ -4,7 +4,7 @@ Date: 2026-08-30
 
 ## Scope and provenance
 
-- Product source base: `a2e7757b19dd5819d15f7ce31357a7b62bc1a2d3`
+- Product source base: `7b22849e18115474253ac7cf1516d4e2587797ba` plus uncommitted Desktop Probe B work
 - App/runtime version: `2.36.0`
 - Target: `x86_64-unknown-linux-gnu` / Debian `amd64`
 - Bun: `1.4.0`
@@ -13,7 +13,8 @@ Date: 2026-08-30
 - `dpkg-deb`: `1.22.22`
 - GTK/WebKitGTK present: `3.24.49` / `2.52.5`
 - Artifact: `OpenCodex_2.36.0_amd64.deb`
-- Artifact SHA-256: `e14bc5150dcc75cdd6b080c3a190113e6e87a5394aab8e39daa2e9cea7fd6ed0`
+- Artifact SHA-256: `6fa042495b355a6c15dddf07b6eb7c3f8a0e36afb261f0c1146e60b6469921ac`
+- Probe A (extract/layout) exit code: `0`
 
 The payload and `.deb` were built in the same working copy. The probe extracted
 the package with `dpkg-deb`; it did not install it or run maintainer scripts.
@@ -35,7 +36,7 @@ node_modules/.bin/bun desktop/scripts/validate-packaging.ts \
 
 node_modules/.bin/bun desktop/scripts/probe-linux-deb.ts \
   --deb desktop/src-tauri/target/release/bundle/deb/OpenCodex_2.36.0_amd64.deb \
-  --sha256 e14bc5150dcc75cdd6b080c3a190113e6e87a5394aab8e39daa2e9cea7fd6ed0
+  --sha256 6fa042495b355a6c15dddf07b6eb7c3f8a0e36afb261f0c1146e60b6469921ac
 ```
 
 The SHA-256 must come from the trusted local build or an independently trusted
@@ -58,7 +59,7 @@ the app executable, and Tauri's Linux resource directory contains the relative
 ## Result
 
 ```text
-probe-linux-deb: ok (package=open-codex, version=2.36.0, arch=amd64, target=x86_64-unknown-linux-gnu, manifest=ocx-runtime-2.36.0-x86_64-unknown-linux-gnu, files=4729, payloadBytes=283739123, debSha256=e14bc5150dcc75cdd6b080c3a190113e6e87a5394aab8e39daa2e9cea7fd6ed0, sidecarSha256=33d56b070be6a9e3da0ab013038b43d1645d0534ca811ecdba4472599117eb4b, install=published+reused, status=stopped, native=ok, pathIsolation=empty)
+probe-linux-deb: ok (package=open-codex, version=2.36.0, arch=amd64, target=x86_64-unknown-linux-gnu, manifest=ocx-runtime-2.36.0-x86_64-unknown-linux-gnu, files=4730, payloadBytes=283749724, debSha256=6fa042495b355a6c15dddf07b6eb7c3f8a0e36afb261f0c1146e60b6469921ac, sidecarSha256=33d56b070be6a9e3da0ab013038b43d1645d0534ca811ecdba4472599117eb4b, install=published+reused, status=stopped, native=ok, pathIsolation=empty)
 ```
 
 The probe verified the extracted runtime tree against its manifest, including
