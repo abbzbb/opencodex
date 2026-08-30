@@ -430,6 +430,13 @@ bun run test
 
 ### 9.2 每个平台的安装后 smoke
 
+Linux x64 已有一个安装前门禁：
+[`phase1-linux-deb-resource-layout.md`](./probes/phase1-linux-deb-resource-layout.md)
+从真实 release `.deb` 解包，验证 Tauri 资源相对路径、双份 runtime 哈希、stable
+首次发布/复用、stable bridge `status` 和 target-native keyring 加载。它不执行
+`dpkg` 安装脚本、不启动代理或 WebView，因此不能替代以下任何安装后 smoke；
+尤其不能把它记为 `/readyz`、session/CSRF 或导航证据。
+
 1. 干净用户，无 Node/Bun/npm/global ocx。
 2. 安装并冷启动，确认 `/readyz` 后才显示 dashboard。
 3. 配置测试 provider，执行一条 Responses 请求。

@@ -90,6 +90,13 @@ bun desktop/scripts/build-runtime.ts \
   --output desktop/src-tauri/resources/runtime
 bun desktop/scripts/validate-packaging.ts --require-real \
   --target x86_64-unknown-linux-gnu
+
+# After building a release .deb, verify its extracted install layout without
+# installing it or launching the WebView. This executes the packaged runtime;
+# use only a trusted local build or a digest from a trusted release channel.
+bun desktop/scripts/probe-linux-deb.ts \
+  --deb desktop/src-tauri/target/release/bundle/deb/OpenCodex_2.36.0_amd64.deb \
+  --sha256 <trusted-lowercase-sha256>
 ```
 
 Do not run the repository-wide `bun run test` for desktop-only runtime/staging
@@ -119,13 +126,19 @@ work.
 
 ## Platform smoke gaps
 
-None of the PLAN §9.2 install-time smokes have been run. Explicit gaps:
+The full PLAN §9.2 install-time smokes have not been run. The Linux x64 Debian
+pre-install probe now verifies the exact extracted resource layout, stable
+runtime publication/reuse, stopped bridge load, and target-native keyring load:
+[`phase1-linux-deb-resource-layout.md`](./probes/phase1-linux-deb-resource-layout.md).
+It does not count as an installed App, `/readyz`, or WebView smoke.
+
+Explicit gaps:
 
 | Gap | Platforms |
 |---|---|
 | Clean machine without Node/Bun/npm/global `ocx` | macOS arm64/x64, Windows x64, Linux x64 `.deb` |
-| Installed App resource layout → stable runtime → `src/cli/index.ts start` → `/readyz` | all first-ship targets |
-| Target-native module load (no host-arch stand-in) | all first-ship targets |
+| Installed App resource layout → stable runtime → `src/cli/index.ts start` → `/readyz` | all first-ship targets; Linux x64 has only the extracted-layout → stable `status` preflight |
+| Target-native module load (no host-arch stand-in) | macOS arm64/x64 and Windows x64; Linux x64 passed from the extracted `.deb` stable generation |
 | Session bootstrap, CSRF write, 6-minute hide/reopen renewal | all first-ship WebViews |
 | Exact-origin navigation + system-browser handoff | all first-ship WebViews |
 | Cold/hot start, 20× double-click, single-instance | all first-ship targets |

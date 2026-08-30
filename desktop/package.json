@@ -7,6 +7,7 @@
   "scripts": {
     "tauri": "tauri",
     "build:runtime": "bun scripts/build-runtime.ts",
+    "probe:linux-deb": "bun scripts/probe-linux-deb.ts",
     "validate:packaging": "bun scripts/validate-packaging.ts",
     "validate:packaging:real": "bun scripts/validate-packaging.ts --require-real"
   },
