@@ -34,6 +34,8 @@ import {
   readCurrentPointer,
   resolveRuntimeByManifestId,
   rollbackCurrent,
+  restoreCurrentPointer,
+  serializeCurrentPointer,
   serializeStoreLockRecord,
   stageRuntime,
   syncPackagedRuntime,
@@ -299,6 +301,224 @@ describe("stable staging transaction", () => {
     if (verified.ok) {
       expect(readFileSync(join(verified.absPath, "src/cli/index.ts"), "utf8")).toContain("2.35.0");
     }
+  });
+
+  test("restoreCurrentPointer CAS-restores the snapshot and refuses a mismatched current", () => {
+    const v1 = writePayload("2.35.0");
+    const v2 = writePayload("2.36.0");
+    const stableRoot = tempDir("ocx-runtime-restore-");
+    const first = activateRuntime({
+      sourceRoot: v1.root,
+      stableRoot,
+      expectedTarget: TARGET,
+      expectedCurrent: null,
+      enforceExecutableBit: POSIX,
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    const snapshot = first.pointer;
+    const second = activateRuntime({
+      sourceRoot: v2.root,
+      stableRoot,
+      expectedTarget: TARGET,
+      expectedCurrent: first.pointer.current,
+      enforceExecutableBit: POSIX,
+    });
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    const restored = restoreCurrentPointer({
+      stableRoot,
+      expectedPublished: second.pointer,
+      restore: snapshot,
+      expectedTarget: TARGET,
+      enforceExecutableBit: POSIX,
+    });
+    expect(restored.ok).toBe(true);
+    if (!restored.ok) return;
+    expect(restored.pointer.current.version).toBe("2.35.0");
+    expect(restored.pointer.previous).toBeNull();
+    const mismatched = restoreCurrentPointer({
+      stableRoot,
+      expectedPublished: second.pointer,
+      restore: snapshot,
+      expectedTarget: TARGET,
+      enforceExecutableBit: POSIX,
+    });
+    expect(mismatched.ok).toBe(false);
+    if (!mismatched.ok) expect(mismatched.code).toBe("cas_mismatch");
+    const live = readCurrentPointer(stableRoot);
+    expect(live.ok && live.pointer?.current.version).toBe("2.35.0");
+  });
+
+  test("restoreCurrentPointer verifies a non-null previous tree and target", () => {
+    const v1 = writePayload("2.35.0");
+    const v2 = writePayload("2.36.0");
+    const v3 = writePayload("2.37.0");
+    const stableRoot = tempDir("ocx-runtime-restore-prev-");
+    const keep = () => true;
+    const first = activateRuntime({
+      sourceRoot: v1.root,
+      stableRoot,
+      expectedTarget: TARGET,
+      expectedCurrent: null,
+      enforceExecutableBit: POSIX,
+      isVersionReferenced: keep,
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    const second = activateRuntime({
+      sourceRoot: v2.root,
+      stableRoot,
+      expectedTarget: TARGET,
+      expectedCurrent: first.pointer.current,
+      enforceExecutableBit: POSIX,
+      isVersionReferenced: keep,
+    });
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    const third = activateRuntime({
+      sourceRoot: v3.root,
+      stableRoot,
+      expectedTarget: TARGET,
+      expectedCurrent: second.pointer.current,
+      enforceExecutableBit: POSIX,
+      isVersionReferenced: keep,
+    });
+    expect(third.ok).toBe(true);
+    if (!third.ok) return;
+
+    rmSync(join(stableRoot, "versions", "2.35.0"), { recursive: true, force: true });
+    const missingPrev = restoreCurrentPointer({
+      stableRoot,
+      expectedPublished: third.pointer,
+      restore: second.pointer,
+      expectedTarget: TARGET,
+      enforceExecutableBit: POSIX,
+    });
+    expect(missingPrev.ok).toBe(false);
+    if (!missingPrev.ok) expect(missingPrev.code).toBe("missing_file");
+    const stillThird = readCurrentPointer(stableRoot);
+    expect(stillThird.ok && stillThird.pointer?.current.version).toBe("2.37.0");
+  });
+
+  test("restoreCurrentPointer refuses a tampered or wrong-target previous generation", () => {
+    const v1 = writePayload("2.35.0");
+    const v2 = writePayload("2.36.0");
+    const v3 = writePayload("2.37.0");
+    const stableRoot = tempDir("ocx-runtime-restore-prev-tamper-");
+    const keep = () => true;
+    const first = activateRuntime({
+      sourceRoot: v1.root,
+      stableRoot,
+      expectedTarget: TARGET,
+      expectedCurrent: null,
+      enforceExecutableBit: POSIX,
+      isVersionReferenced: keep,
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    const second = activateRuntime({
+      sourceRoot: v2.root,
+      stableRoot,
+      expectedTarget: TARGET,
+      expectedCurrent: first.pointer.current,
+      enforceExecutableBit: POSIX,
+      isVersionReferenced: keep,
+    });
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    const third = activateRuntime({
+      sourceRoot: v3.root,
+      stableRoot,
+      expectedTarget: TARGET,
+      expectedCurrent: second.pointer.current,
+      enforceExecutableBit: POSIX,
+      isVersionReferenced: keep,
+    });
+    expect(third.ok).toBe(true);
+    if (!third.ok) return;
+
+    writeFileSync(join(stableRoot, "versions", "2.35.0", "src/cli/index.ts"), "tampered\n");
+    const tampered = restoreCurrentPointer({
+      stableRoot,
+      expectedPublished: third.pointer,
+      restore: second.pointer,
+      expectedTarget: TARGET,
+      enforceExecutableBit: POSIX,
+    });
+    expect(tampered.ok).toBe(false);
+    if (!tampered.ok) expect(["hash_mismatch", "invalid_pointer"]).toContain(tampered.code);
+    expect(readCurrentPointer(stableRoot).ok && readCurrentPointer(stableRoot).ok).toBe(true);
+    const live = readCurrentPointer(stableRoot);
+    expect(live.ok && live.pointer?.current.version).toBe("2.37.0");
+
+    const wrongTarget = restoreCurrentPointer({
+      stableRoot,
+      expectedPublished: third.pointer,
+      restore: {
+        ...second.pointer,
+        previous: second.pointer.previous
+          ? { ...second.pointer.previous, target: "aarch64-apple-darwin" }
+          : null,
+      },
+      expectedTarget: TARGET,
+      enforceExecutableBit: POSIX,
+    });
+    expect(wrongTarget.ok).toBe(false);
+    if (!wrongTarget.ok) expect(wrongTarget.code).toBe("target_mismatch");
+    const still = readCurrentPointer(stableRoot);
+    expect(still.ok && still.pointer?.current.version).toBe("2.37.0");
+  });
+
+  test("restoreCurrentPointer CAS requires the published previous, not only current", () => {
+    const v1 = writePayload("2.35.0");
+    const v2 = writePayload("2.36.0");
+    const v3 = writePayload("2.37.0");
+    const stableRoot = tempDir("ocx-runtime-restore-cas-prev-");
+    const first = activateRuntime({
+      sourceRoot: v1.root,
+      stableRoot,
+      expectedTarget: TARGET,
+      expectedCurrent: null,
+      enforceExecutableBit: POSIX,
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    const second = activateRuntime({
+      sourceRoot: v2.root,
+      stableRoot,
+      expectedTarget: TARGET,
+      expectedCurrent: first.pointer.current,
+      enforceExecutableBit: POSIX,
+    });
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    const third = activateRuntime({
+      sourceRoot: v3.root,
+      stableRoot,
+      expectedTarget: TARGET,
+      expectedCurrent: second.pointer.current,
+      enforceExecutableBit: POSIX,
+    });
+    expect(third.ok).toBe(true);
+    if (!third.ok) return;
+    writeFileSync(join(stableRoot, CURRENT_POINTER_NAME), serializeCurrentPointer({
+      schemaVersion: 1,
+      current: third.pointer.current,
+      previous: first.pointer.current,
+    }));
+    const mismatched = restoreCurrentPointer({
+      stableRoot,
+      expectedPublished: third.pointer,
+      restore: second.pointer,
+      expectedTarget: TARGET,
+      enforceExecutableBit: POSIX,
+    });
+    expect(mismatched.ok).toBe(false);
+    if (!mismatched.ok) expect(mismatched.code).toBe("cas_mismatch");
+    const live = readCurrentPointer(stableRoot);
+    expect(live.ok && live.pointer?.current.version).toBe("2.37.0");
+    expect(live.ok && live.pointer?.previous?.version).toBe("2.35.0");
   });
 
   test("a held current.lock fails closed and leaves the previous current usable", () => {

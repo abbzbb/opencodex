@@ -243,6 +243,18 @@ describe("desktop-owner leaf", () => {
       serviceInstall: { bunPath: "/usr/local/bin/bun", cliPath: "/usr/local/lib/ocx/src/cli/index.ts" },
       isAlive: () => true,
     }).owner).toBe("existing-external");
+    expect(classifyDesktopOwner({
+      identity,
+      livePid: 11,
+      livePort: 10100,
+      commandLine: `${identity.bunPath} ${identity.cliPath} start`,
+      service: { installed: true, startable: true, conflict: false },
+      serviceInstall: {
+        bunPath: "/opt/opencodex/versions/2.35.0/other-bun",
+        cliPath: identity.cliPath,
+      },
+      isAlive: () => true,
+    }).owner).toBe("existing-external");
   });
 
   test("absent records with a live proxy are existing-external", () => {

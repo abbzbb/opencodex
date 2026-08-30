@@ -236,6 +236,10 @@ function normalizePath(value: string): string {
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
+export function pathsEqualCanonical(left: string, right: string): boolean {
+  return normalizePath(left) === normalizePath(right);
+}
+
 export function isPathInsideRoot(root: string, target: string): boolean {
   if (!isSafeAbsolutePath(root) || !isSafeAbsolutePath(target)) return false;
   const rel = relative(normalizePath(root), normalizePath(target));
@@ -395,7 +399,9 @@ function servicePathsInsideRuntime(
   install: DesktopServiceInstallPaths | null | undefined,
 ): boolean {
   if (!install?.bunPath || !install.cliPath) return false;
-  return isPathInsideRoot(identity.stableRuntimeRoot, install.bunPath)
+  return normalizePath(install.bunPath) === normalizePath(identity.bunPath)
+    && normalizePath(install.cliPath) === normalizePath(identity.cliPath)
+    && isPathInsideRoot(identity.stableRuntimeRoot, install.bunPath)
     && isPathInsideRoot(identity.stableRuntimeRoot, install.cliPath);
 }
 

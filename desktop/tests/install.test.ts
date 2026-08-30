@@ -176,4 +176,23 @@ describe("packaged runtime installer protocol", () => {
     expect(called).toBe(false);
     expect(result.text).not.toContain(sourceRoot);
   });
+
+  test("refuses to stage or publish around an unresolved activation journal", async () => {
+    const sourceRoot = payload("2.36.0");
+    const stableRoot = tempDir("ocx-install-journal-");
+    writeFileSync(join(stableRoot, "activation.journal"), "unresolved\n");
+    let called = false;
+    const result = await invoke({
+      cwd: sourceRoot,
+      stdin: JSON.stringify({ schemaVersion: 1, target: TARGET, stableRoot }),
+      syncRuntime: () => {
+        called = true;
+        throw new Error("must not run");
+      },
+    });
+    expect(result.code).toBe(EXIT_RUNTIME_FAILURE);
+    expect(called).toBe(false);
+    expect(result.value.error.retryable).toBe(false);
+    expect(result.text).not.toContain(stableRoot);
+  });
 });

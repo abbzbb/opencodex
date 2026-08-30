@@ -287,7 +287,7 @@ describe("systemd service unit", () => {
 
   test("service start checks for the systemd user unit before shelling out", async () => {
     const service = await readText("src/service.ts");
-    const installSystemd = service.slice(service.indexOf("function installSystemd()"), service.indexOf("function startSystemd()"));
+    const installSystemd = service.slice(service.indexOf("function installSystemd("), service.indexOf("function startSystemd("));
     const startSystemd = service.slice(service.indexOf("function startSystemd()"), service.indexOf("function stopSystemd()"));
 
     const unitCheckAt = startSystemd.indexOf("existsSync(unitPath())");
@@ -300,7 +300,7 @@ describe("systemd service unit", () => {
 
     // The write goes through writeServiceDefinitionFile so the unit lands 0600: it can carry a
     // proxy credential (#2107). What this test pins is the ORDER — write, then reload.
-    const writeAt = installSystemd.indexOf('writeServiceDefinitionFile(unitPath(), buildUnit(), "utf8")');
+    const writeAt = installSystemd.indexOf('writeServiceDefinitionFile(unitPath(), buildUnit(resolvedProxyEnv(), runtime), "utf8")');
     const reloadAt = installSystemd.indexOf("systemctl --user daemon-reload");
     const enableAt = installSystemd.indexOf("systemctl --user enable");
     const restartAt = installSystemd.indexOf("systemctl --user restart");
@@ -1599,13 +1599,13 @@ describe("service lifecycle cleanup ordering", () => {
   test("Windows service install ends the running task before rewriting its assets, with write retry", async () => {
     const service = await readText("src/service.ts");
     const assetsHelper = service.slice(
-      service.indexOf("function writeWindowsSchedulerAssets()"),
-      service.indexOf("function installWindows()"),
+      service.indexOf("function writeWindowsSchedulerAssets("),
+      service.indexOf("function installWindows("),
     );
-    const installWindows = service.slice(service.indexOf("function installWindows()"), service.indexOf("async function installWindowsNative()"));
+    const installWindows = service.slice(service.indexOf("function installWindows("), service.indexOf("async function installWindowsNative("));
 
     const stopAt = installWindows.indexOf("stopWindows();");
-    const assetsAt = installWindows.indexOf("writeWindowsSchedulerAssets();");
+    const assetsAt = installWindows.indexOf("writeWindowsSchedulerAssets(runtime)");
     const createAt = installWindows.indexOf("buildWindowsSchtasksCreateArgs");
     expect(stopAt).toBeGreaterThan(-1);
     expect(assetsAt).toBeGreaterThan(-1);

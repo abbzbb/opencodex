@@ -1,4 +1,6 @@
 import { isAbsolute, resolve } from "node:path";
+import { observeActivationLock } from "./activation-lock";
+import { observeActivationJournal } from "./activation-journal";
 import { decodeStdin, MAX_REQUEST_BYTES } from "./codec";
 import {
   isInsideRoot,
@@ -201,6 +203,15 @@ export async function runInstall(options: RunInstallOptions = {}): Promise<numbe
   const stableRoot = resolve(parsed.request.stableRoot);
   if (isInsideRoot(sourceRoot, stableRoot) || isInsideRoot(stableRoot, sourceRoot)) {
     return emit(runtimeFailure(false), options);
+  }
+
+  const journal = observeActivationJournal(stableRoot);
+  if (journal.state !== "absent") {
+    return emit(runtimeFailure(false), options);
+  }
+  const lock = observeActivationLock(stableRoot);
+  if (lock.state === "live" || lock.state === "incomplete") {
+    return emit(runtimeFailure(lock.state === "live"), options);
   }
 
   let synced: RuntimeStoreResult<SyncPackagedRuntimeSuccess>;

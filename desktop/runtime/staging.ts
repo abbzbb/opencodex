@@ -17,6 +17,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
+import { observeActivationLock } from "./activation-lock";
 import {
   MANIFEST_FILE_NAME,
   asObject,
@@ -141,6 +142,17 @@ export type RollbackCurrentInput = {
   hooks?: StagingHooks;
 };
 
+export type RestoreCurrentInput = {
+  stableRoot: string;
+  /** Exact pointer this transaction published; current+previous must still match. */
+  expectedPublished: CurrentPointer;
+  restore: CurrentPointer;
+  expectedTarget: TargetTriple;
+  enforceExecutableBit?: boolean;
+  isVersionReferenced?: VersionReferenceGuard;
+  hooks?: StagingHooks;
+};
+
 export type ActivateRuntimeInput = StageRuntimeInput & {
   expectedCurrent: VersionPointer | null;
   isVersionReferenced?: VersionReferenceGuard;
@@ -165,7 +177,7 @@ export type ResolveRuntimeInput = {
 const POINTER_KEYS = ["schemaVersion", "current", "previous"] as const;
 const VERSION_POINTER_KEYS = ["id", "version", "target", "relPath"] as const;
 
-function pointersEqual(left: VersionPointer | null, right: VersionPointer | null): boolean {
+export function pointersEqual(left: VersionPointer | null, right: VersionPointer | null): boolean {
   if (left === null || right === null) {
     return left === right;
   }
@@ -1423,6 +1435,79 @@ function rollbackCurrentLocked(input: RollbackCurrentInput): RuntimeStoreResult<
   return okStore({ pointer: next, pruned: pruned.pruned, retained: pruned.retained });
 }
 
+export function currentPointersEqual(left: CurrentPointer | null, right: CurrentPointer | null): boolean {
+  if (left === null || right === null) {
+    return left === right;
+  }
+  return left.schemaVersion === right.schemaVersion
+    && pointersEqual(left.current, right.current)
+    && pointersEqual(left.previous, right.previous);
+}
+
+function restoreCurrentLocked(input: RestoreCurrentInput): RuntimeStoreResult<PublishCurrentSuccess> {
+  const stable = ensureStableRoot(input.stableRoot);
+  if (!stable.ok) {
+    return stable;
+  }
+  const enforceExecutableBit = input.enforceExecutableBit ?? defaultEnforceExecutableBit();
+  const observed = readCurrentPointer(stable.root);
+  if (!observed.ok) {
+    return observed;
+  }
+  if (!currentPointersEqual(observed.pointer, input.expectedPublished)) {
+    return failStore("cas_mismatch", "current.json does not match the expected pointer");
+  }
+  const parsed = parseCurrentPointer({
+    schemaVersion: input.restore.schemaVersion,
+    current: input.restore.current,
+    previous: input.restore.previous,
+  });
+  if (!parsed.ok) {
+    return parsed;
+  }
+  const restore = parsed.pointer;
+  if (restore.current.target !== input.expectedTarget) {
+    return failStore("target_mismatch", "restore pointer target does not match the expected target");
+  }
+  const absPath = versionAbsPath(stable.root, restore.current.version);
+  const verified = verifyStagedVersion(absPath, restore.current, input.expectedTarget, enforceExecutableBit);
+  if (!verified.ok) {
+    return verified;
+  }
+  if (restore.previous) {
+    if (restore.previous.target !== input.expectedTarget) {
+      return failStore("target_mismatch", "restore previous pointer target does not match the expected target");
+    }
+    const previousAbs = versionAbsPath(stable.root, restore.previous.version);
+    const previousVerified = verifyStagedVersion(
+      previousAbs,
+      restore.previous,
+      input.expectedTarget,
+      enforceExecutableBit,
+    );
+    if (!previousVerified.ok) {
+      return previousVerified;
+    }
+  }
+  if (currentPointersEqual(observed.pointer, restore)) {
+    return okStore({
+      pointer: observed.pointer ?? restore,
+      pruned: [],
+      retained: [...liveRelPaths(observed.pointer ?? restore)],
+    });
+  }
+  input.hooks?.beforePublish?.();
+  const written = writeCurrentPointerAtomic(stable.root, restore, input.hooks);
+  if (!written.ok) {
+    return written;
+  }
+  return okStore({
+    pointer: restore,
+    pruned: [],
+    retained: [...liveRelPaths(restore)],
+  });
+}
+
 export function stageRuntime(input: StageRuntimeInput): RuntimeStoreResult<StageRuntimeSuccess> {
   return withStoreLock(input.stableRoot, input.hooks, () => stageRuntimeLocked(input));
 }
@@ -1433,6 +1518,10 @@ export function publishCurrent(input: PublishCurrentInput): RuntimeStoreResult<P
 
 export function rollbackCurrent(input: RollbackCurrentInput): RuntimeStoreResult<PublishCurrentSuccess> {
   return withStoreLock(input.stableRoot, input.hooks, () => rollbackCurrentLocked(input));
+}
+
+export function restoreCurrentPointer(input: RestoreCurrentInput): RuntimeStoreResult<PublishCurrentSuccess> {
+  return withStoreLock(input.stableRoot, input.hooks, () => restoreCurrentLocked(input));
 }
 
 export function activateRuntime(input: ActivateRuntimeInput): RuntimeStoreResult<ActivateRuntimeSuccess> {
@@ -1472,6 +1561,18 @@ export function syncPackagedRuntime(
     const stable = ensureStableRoot(input.stableRoot);
     if (!stable.ok) {
       return stable;
+    }
+    const journalPath = join(stable.root, "activation.journal");
+    const journal = fileExistsLstat(journalPath);
+    if (!journal.ok) {
+      return journal;
+    }
+    if (journal.exists) {
+      return failStore("version_in_use", "unresolved activation journal");
+    }
+    const lock = observeActivationLock(stable.root);
+    if (lock.state === "live" || lock.state === "incomplete") {
+      return failStore("lock_held", "activation lock is held");
     }
     const retainEveryGeneration: VersionReferenceGuard = () => true;
     const staged = stageRuntimeLocked({

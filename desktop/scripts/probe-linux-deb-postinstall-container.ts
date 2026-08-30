@@ -337,8 +337,8 @@ async function main(): Promise<void> {
       fail("clean install service state is not absent");
     }
     if (!Array.isArray(status.allowedMutations)
-      || status.allowedMutations.length !== 1
-      || status.allowedMutations[0] !== "stop") {
+      || status.allowedMutations[0] !== "stop"
+      || (status.allowedMutations.length === 1 ? false : status.allowedMutations.length !== 2 || status.allowedMutations[1] !== "service-install")) {
       fail("desktop-direct mutation set is invalid");
     }
     if (typeof status.pid !== "number" || !Number.isSafeInteger(status.pid) || status.pid <= 0) {

@@ -141,10 +141,21 @@ has two probes:
   package removal:
   [`phase1-linux-deb-postinstall.md`](./probes/phase1-linux-deb-postinstall.md)
 
-Neither probe is WebView, session/CSRF, or navigation evidence. The post-install
-probe directly asserted no Codex CLI and checked the full `current.json`
-identity plus uninstall (resource tree gone and package not installed).
-`/readyz` used the proven-absent `config.toml` no-op.
+Deterministic Probe C transaction foundation is implemented
+([`probe-c-service-runtime-transaction.md`](./probes/probe-c-service-runtime-transaction.md)):
+checksummed owner-only journal, cross-process activation lock, verified stable
+resolution, exact service paths, stop / install-or-repair / start / strict
+ready / full-pointer publish, rollback, and the canonical `canRespawn` absence
+window. Service managers in that evidence are fakes/seams, not physical platform
+smoke. Probe C remains OPEN until macOS launchd, Windows scheduler/WinSW, Linux
+`.deb` systemd service smoke, and the production desktop-direct survivor/update
+path are wired and proven. The service-path / global-stop shared-lock race
+remains WATCH.
+
+Neither Linux `.deb` probe is WebView, session/CSRF, or navigation evidence.
+The post-install probe directly asserted no Codex CLI and checked the full
+`current.json` identity plus uninstall (resource tree gone and package not
+installed). `/readyz` used the proven-absent `config.toml` no-op.
 
 Explicit gaps:
 

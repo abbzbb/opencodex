@@ -71,7 +71,7 @@ describe("systemd detection tolerates a no-DBUS SSH session (F9)", () => {
     expect(src).toMatch(/catch \{ \/\* no user bus in this session \*\/ \}\s*\n\s*return userRuntimeDir\(\) !== null;/);
   });
   test("install ensures the user-bus env before touching systemctl --user", () => {
-    expect(src).toMatch(/function installSystemd\(\): void \{\s*\n\s*ensureUserBusEnv\(\);/);
+    expect(src).toMatch(/function installSystemd\(runtime\?: ServiceRuntimeIdentity\): void \{\s*\n\s*ensureUserBusEnv\(\);/);
   });
 });
 

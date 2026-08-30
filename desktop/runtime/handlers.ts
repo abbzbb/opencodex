@@ -8,7 +8,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { restoreNativeCodexAsync } from "../../src/codex/inject";
 import { loadConfig } from "../../src/config";
@@ -34,7 +34,7 @@ import {
 import { runStopTransaction, type StopTransactionResult } from "../../src/cli/stop-transaction";
 import { stripGrokConfig } from "../../src/grok/inject";
 import { withProcessRuntimeProvenance } from "../../src/lib/bun-runtime";
-import { ProxyOwnershipRefusedError, stopProxy } from "../../src/lib/process-control";
+import { ProxyOwnershipRefusedError, stopProxy, stopProxyGracefully } from "../../src/lib/process-control";
 import { redactSecretString, redactUserPath } from "../../src/lib/redact";
 import { selfLaunchArgv } from "../../src/lib/self-launch-argv";
 import { isLoopbackHostname } from "../../src/server/auth-cors";
@@ -47,8 +47,12 @@ import { revertSystemEnv } from "../../src/server/system-env";
 import {
   diagnoseService,
   inspectServiceStateEvidence,
+  installManagedServiceWithRuntime,
   isServiceOwnershipError,
+  repairService,
   stopServiceForTransaction,
+  uninstallServiceIfInstalled,
+  type ManagedServiceStopOutcome,
   type ServiceDiagnostic,
 } from "../../src/service";
 import { DeadlineExceededError } from "./deadline";
@@ -67,9 +71,21 @@ import type {
   Operation,
   Owner,
   ProxyStatus,
+  ServiceInstallBackend,
+  ServiceInstallPayload,
+  ServiceRepairPayload,
   ServiceState,
   StatusResult,
 } from "./protocol";
+import {
+  activationIsPending,
+  recoverDesktopActivationIfNeeded,
+  runDesktopServiceMutation,
+  stableStoreRootFromIdentity,
+  type DesktopServiceMutationDeps,
+  type OwnedLiveStopRequest,
+  type ServiceManagerEffect,
+} from "./service-activation";
 
 const CLI_ENTRY_REL = "src/cli/index.ts";
 const STABLE_VERSIONS_DIR = "versions";
@@ -95,8 +111,26 @@ export type BridgeHandlerDeps = {
   cwd?: string;
   getBindHostname?: () => string | undefined;
   getPreferredPort?: () => number | undefined;
-  startDirect?: (input: { descriptorPath: string | null; port?: number; cwd: string }) => Promise<void>;
+  startDirect?: (input: {
+    descriptorPath: string | null;
+    port?: number;
+    cwd: string;
+    identity: DesktopRuntimeIdentity;
+  }) => Promise<void>;
   startService?: () => Promise<void>;
+  startServiceIdentity?: (identity: DesktopRuntimeIdentity) => Promise<void>;
+  installServiceRuntime?: (
+    identity: DesktopRuntimeIdentity,
+    backend: ServiceInstallBackend,
+  ) => Promise<void | ServiceManagerEffect>;
+  repairServiceRuntime?: (
+    identity: DesktopRuntimeIdentity,
+    opts?: { backend?: ServiceDiagnostic["backend"] },
+  ) => Promise<void | ServiceManagerEffect>;
+  uninstallServiceRuntime?: () => boolean | Promise<boolean>;
+  afterCandidateReady?: () => void | Promise<void>;
+  stopOwnedServiceRuntime?: () => ManagedServiceStopOutcome | Promise<ManagedServiceStopOutcome>;
+  stopOwnedLiveRuntime?: (request: OwnedLiveStopRequest) => Promise<void> | void;
   runStopTransaction?: () => Promise<StopTransactionResult>;
   isAlive?: (pid: number) => boolean;
   hasForbiddenEnvFile?: (cwd: string) => boolean;
@@ -118,7 +152,7 @@ function safeMessage(value: unknown, fallback: string): string {
 }
 
 function errorOutcome(
-  code: "ownership_conflict" | "service_not_startable" | "proxy_not_ready" | "runtime_integrity_failed" | "unsupported_operation" | "stop_failed",
+  code: "ownership_conflict" | "service_not_startable" | "proxy_not_ready" | "runtime_integrity_failed" | "unsupported_operation" | "stop_failed" | "restore_failed",
   message: string,
   retryable: boolean,
 ): HandlerOutcome {
@@ -201,8 +235,22 @@ function mapServiceState(service: ServiceDiagnostic, extraConflict: boolean): Se
   return { installed: true, startable: false, stateCode: "not-startable" };
 }
 
-function allowedMutationsFor(owner: Owner): Operation[] {
-  return owner === "unknown/conflict" ? [] : ["stop"];
+export function allowedMutationsFor(
+  owner: Owner,
+  service: ServiceState = { installed: false, startable: false, stateCode: "absent" },
+  identity: DesktopRuntimeIdentity | null = null,
+  livePid: number | null = null,
+): Operation[] {
+  if (owner === "unknown/conflict") return [];
+  if (!identity) return ["stop"];
+  if (owner === "desktop-service") {
+    return ["stop", "service-start", "service-repair", "service-uninstall"];
+  }
+  if (owner === "desktop-direct") return ["stop", "service-install"];
+  if (owner === "existing-external" && !service.installed && livePid === null) {
+    return ["stop", "service-install"];
+  }
+  return ["stop"];
 }
 
 function isAttachableBind(hostname: string | undefined): boolean {
@@ -349,6 +397,64 @@ async function productionStartService(identity: DesktopRuntimeIdentity, cwd: str
   });
 }
 
+function serviceBackendFor(backend: ServiceInstallBackend): "scheduler" | "native" {
+  return backend === "windows-native" ? "native" : "scheduler";
+}
+
+async function productionInstallService(
+  identity: DesktopRuntimeIdentity,
+  backend: ServiceInstallBackend,
+): Promise<ServiceManagerEffect> {
+  await installManagedServiceWithRuntime(
+    { bunPath: identity.bunPath, cliPath: identity.cliPath },
+    { backend: serviceBackendFor(backend) },
+  );
+  return { managerStarted: true };
+}
+
+async function productionRepairService(
+  identity: DesktopRuntimeIdentity,
+  opts?: { backend?: ServiceDiagnostic["backend"] },
+): Promise<ServiceManagerEffect> {
+  const backend = opts?.backend === "native" || opts?.backend === "scheduler" ? opts.backend : undefined;
+  await repairService({
+    runtime: { bunPath: identity.bunPath, cliPath: identity.cliPath },
+    ...(backend ? { backend } : {}),
+  });
+  return { managerStarted: true };
+}
+
+function productionStopOwnedService(): ManagedServiceStopOutcome {
+  return stopServiceForTransaction();
+}
+
+async function productionStopOwnedLive(
+  io: {
+    findLiveProxy: () => Promise<LiveProxy | null>;
+    classifyOwner: (live: LiveProxy | null, identity: DesktopRuntimeIdentity | null) => Owner;
+  },
+  request: OwnedLiveStopRequest,
+): Promise<void> {
+  const current = await io.findLiveProxy();
+  if (!current?.pid || current.pid !== request.live.pid) {
+    throw new Error("owned live proxy disappeared before stop");
+  }
+  if (current.version !== request.identity.runtimeVersion) {
+    throw new Error("owned live proxy identity changed before stop");
+  }
+  if (!isAttachableBind(current.hostname)) {
+    throw new Error("owned live proxy bind is not loopback");
+  }
+  const owner = io.classifyOwner(current, request.identity);
+  if (owner !== request.expectedOwner) {
+    throw new Error("owned live proxy owner changed before stop");
+  }
+  const graceful = await stopProxyGracefully(current.pid);
+  if (graceful === "refused" || graceful === false) {
+    throw new Error("owned live graceful stop failed");
+  }
+}
+
 async function productionStop(): Promise<StopTransactionResult> {
   return runStopTransaction({
     stopServiceIfInstalled: stopServiceForTransaction,
@@ -406,8 +512,26 @@ type RequiredHandlerDeps = {
   cwd: string;
   getBindHostname: () => string | undefined;
   getPreferredPort: () => number | undefined;
-  startDirect: (input: { descriptorPath: string | null; port?: number; cwd: string }) => Promise<void>;
+  startDirect: (input: {
+    descriptorPath: string | null;
+    port?: number;
+    cwd: string;
+    identity: DesktopRuntimeIdentity;
+  }) => Promise<void>;
   startService: () => Promise<void>;
+  startServiceIdentity: (identity: DesktopRuntimeIdentity) => Promise<void>;
+  installServiceRuntime: (
+    identity: DesktopRuntimeIdentity,
+    backend: ServiceInstallBackend,
+  ) => Promise<void | ServiceManagerEffect>;
+  repairServiceRuntime: (
+    identity: DesktopRuntimeIdentity,
+    opts?: { backend?: ServiceDiagnostic["backend"] },
+  ) => Promise<void | ServiceManagerEffect>;
+  uninstallServiceRuntime: () => boolean | Promise<boolean>;
+  afterCandidateReady?: () => void | Promise<void>;
+  stopOwnedServiceRuntime: () => ManagedServiceStopOutcome | Promise<ManagedServiceStopOutcome>;
+  stopOwnedLiveRuntime: (request: OwnedLiveStopRequest) => Promise<void> | void;
   runStopTransaction: () => Promise<StopTransactionResult>;
   isAlive: (pid: number) => boolean;
   hasForbiddenEnvFile: (cwd: string) => boolean;
@@ -416,7 +540,7 @@ type RequiredHandlerDeps = {
 function resolveDeps(deps: BridgeHandlerDeps): RequiredHandlerDeps {
   const cwd = deps.cwd ?? process.cwd();
   const identity = deps.identity === undefined ? resolveDesktopRuntimeIdentity(cwd) : deps.identity;
-  return {
+  const resolved: RequiredHandlerDeps = {
     now: deps.now ?? Date.now,
     sleep: deps.sleep ?? defaultSleep,
     findLiveProxy: deps.findLiveProxy ?? (() => findLiveProxy()),
@@ -428,14 +552,21 @@ function resolveDeps(deps: BridgeHandlerDeps): RequiredHandlerDeps {
     cwd,
     getBindHostname: deps.getBindHostname ?? (() => loadConfig().hostname),
     getPreferredPort: deps.getPreferredPort ?? (() => loadConfig().port),
-    startDirect: deps.startDirect ?? (input => {
-      if (!identity) throw new Error("desktop runtime identity is unavailable");
-      return productionStartDirect({ ...input, identity });
-    }),
+    startDirect: deps.startDirect ?? (input => productionStartDirect({ ...input, identity: input.identity })),
     startService: deps.startService ?? (() => {
       if (!identity) throw new Error("desktop runtime identity is unavailable");
       return productionStartService(identity, cwd);
     }),
+    startServiceIdentity: deps.startServiceIdentity ?? (target => productionStartService(target, cwd)),
+    installServiceRuntime: deps.installServiceRuntime ?? ((target, backend) => productionInstallService(target, backend)),
+    repairServiceRuntime: deps.repairServiceRuntime ?? ((target, opts) => productionRepairService(target, opts)),
+    uninstallServiceRuntime: deps.uninstallServiceRuntime ?? (() => uninstallServiceIfInstalled()),
+    ...(deps.afterCandidateReady ? { afterCandidateReady: deps.afterCandidateReady } : {}),
+    stopOwnedServiceRuntime: deps.stopOwnedServiceRuntime ?? productionStopOwnedService,
+    stopOwnedLiveRuntime: deps.stopOwnedLiveRuntime ?? (request => productionStopOwnedLive({
+      findLiveProxy: () => resolved.findLiveProxy(),
+      classifyOwner: (live, target) => snapshotOwner({ ...resolved, identity: target }, live),
+    }, request)),
     runStopTransaction: deps.runStopTransaction ?? productionStop,
     isAlive: deps.isAlive ?? (pid => {
       try {
@@ -447,6 +578,7 @@ function resolveDeps(deps: BridgeHandlerDeps): RequiredHandlerDeps {
     }),
     hasForbiddenEnvFile: deps.hasForbiddenEnvFile ?? cwdHasForbiddenEnvFile,
   };
+  return resolved;
 }
 
 async function probeLive(
@@ -474,6 +606,7 @@ function statusResult(input: {
   version: string | null;
   owner: Owner;
   service: ServiceState;
+  identity: DesktopRuntimeIdentity | null;
 }): StatusResult {
   return {
     status: input.status,
@@ -482,7 +615,7 @@ function statusResult(input: {
     version: input.version,
     owner: input.owner,
     service: input.service,
-    allowedMutations: allowedMutationsFor(input.owner),
+    allowedMutations: allowedMutationsFor(input.owner, input.service, input.identity, input.pid),
   };
 }
 
@@ -511,6 +644,7 @@ async function currentStatus(deps: RequiredHandlerDeps, signal: AbortSignal): Pr
         version: null,
         owner,
         service,
+        identity: deps.identity,
       }),
     };
   }
@@ -528,6 +662,7 @@ async function currentStatus(deps: RequiredHandlerDeps, signal: AbortSignal): Pr
       version: probed.version,
       owner,
       service,
+      identity: deps.identity,
     }),
   };
 }
@@ -574,6 +709,7 @@ function bootstrapResult(input: {
   version: string;
   owner: Owner;
   service: ServiceState;
+  identity: DesktopRuntimeIdentity | null;
 }): HandlerOutcome {
   if (input.owner === "unknown/conflict") {
     return errorOutcome("ownership_conflict", "ownership evidence is conflicting", false);
@@ -585,17 +721,55 @@ function bootstrapResult(input: {
     version: input.version,
     owner: input.owner,
     service: input.service,
-    allowedMutations: allowedMutationsFor(input.owner),
+    allowedMutations: allowedMutationsFor(input.owner, input.service, input.identity, input.pid),
   };
   return { ok: true, result };
 }
 
+function stableRootIfPresent(deps: RequiredHandlerDeps): string | null {
+  if (!deps.identity) return null;
+  const root = stableStoreRootFromIdentity(deps.identity);
+  if (!root || !existsSync(root)) return null;
+  return root;
+}
+
+async function observeOrRecoverActivation(
+  deps: RequiredHandlerDeps,
+  signal: AbortSignal,
+  mode: "status" | "bootstrap",
+): Promise<HandlerOutcome | null> {
+  const stableRoot = stableRootIfPresent(deps);
+  if (!stableRoot) return null;
+  const pending = activationIsPending(stableRoot, deps.isAlive);
+  if (!pending.pending) return null;
+  if (mode === "status") {
+    const current = await currentStatus(deps, signal);
+    return {
+      ok: true,
+      result: {
+        ...current.status,
+        status: "pending",
+        allowedMutations: [],
+      },
+    };
+  }
+  if (!pending.recoverable) {
+    return errorOutcome("service_not_startable", "activation is in progress", true);
+  }
+  const current = await currentStatus(deps, signal);
+  return recoverDesktopActivationIfNeeded(serviceMutationDeps(deps, current, signal), stableRoot);
+}
+
 async function handleStatus(deps: RequiredHandlerDeps, signal: AbortSignal): Promise<HandlerOutcome> {
+  const pending = await observeOrRecoverActivation(deps, signal, "status");
+  if (pending) return pending;
   const current = await currentStatus(deps, signal);
   return { ok: true, result: current.status };
 }
 
 async function handleBootstrap(deps: RequiredHandlerDeps, signal: AbortSignal): Promise<HandlerOutcome> {
+  const recovered = await observeOrRecoverActivation(deps, signal, "bootstrap");
+  if (recovered) return recovered;
   const current = await currentStatus(deps, signal);
   if (current.owner === "unknown/conflict") {
     return errorOutcome("ownership_conflict", "ownership evidence is conflicting", false);
@@ -614,6 +788,7 @@ async function handleBootstrap(deps: RequiredHandlerDeps, signal: AbortSignal): 
       version: waited.version,
       owner,
       service: current.service,
+      identity: deps.identity,
     });
   }
 
@@ -629,6 +804,7 @@ async function handleBootstrap(deps: RequiredHandlerDeps, signal: AbortSignal): 
       version: waited.version,
       owner,
       service: current.service,
+      identity: deps.identity,
     });
   }
 
@@ -654,6 +830,7 @@ async function handleBootstrap(deps: RequiredHandlerDeps, signal: AbortSignal): 
       descriptorPath,
       port: deps.getPreferredPort(),
       cwd: deps.cwd,
+      identity: deps.identity,
     });
   }
 
@@ -668,6 +845,7 @@ async function handleBootstrap(deps: RequiredHandlerDeps, signal: AbortSignal): 
     version: waited.version,
     owner,
     service,
+    identity: deps.identity,
   });
 }
 
@@ -679,6 +857,68 @@ async function handleStop(deps: RequiredHandlerDeps, signal: AbortSignal): Promi
   const result = await deps.runStopTransaction();
   throwIfAborted(signal);
   return { ok: true, result };
+}
+
+function serviceMutationDeps(
+  deps: RequiredHandlerDeps,
+  current: Awaited<ReturnType<typeof currentStatus>>,
+  signal: AbortSignal,
+): DesktopServiceMutationDeps {
+  return {
+    signal,
+    identity: deps.identity,
+    owner: current.owner,
+    live: current.live,
+    service: current.service,
+    expectedTarget: currentTargetTriple(),
+    platform: process.platform,
+    sleep: deps.sleep,
+    diagnoseService: deps.diagnoseService,
+    inspectServiceInstall: deps.inspectServiceInstall,
+    findLiveProxy: deps.findLiveProxy,
+    probeReadiness: deps.probeReadiness,
+    runStopTransaction: deps.runStopTransaction,
+    stopOwnedLive: request => deps.stopOwnedLiveRuntime(request),
+    stopOwnedService: () => deps.stopOwnedServiceRuntime(),
+    isAlive: deps.isAlive,
+    classifyOwner: (live, identity) => snapshotOwner({ ...deps, identity }, live),
+    installService: deps.installServiceRuntime,
+    repairService: deps.repairServiceRuntime,
+    startService: deps.startServiceIdentity,
+    startDirect: target => deps.startDirect({
+      descriptorPath: createDesktopLaunchDescriptor(target).path,
+      port: deps.getPreferredPort(),
+      cwd: target.stableRuntimeRoot,
+      identity: target,
+    }),
+    uninstallService: deps.uninstallServiceRuntime,
+    resolveIdentity: resolveDesktopRuntimeIdentity,
+    ...(deps.afterCandidateReady ? { afterCandidateReady: deps.afterCandidateReady } : {}),
+  };
+}
+
+async function handleServiceMutation(
+  deps: RequiredHandlerDeps,
+  request: BridgeRequest,
+  signal: AbortSignal,
+): Promise<HandlerOutcome> {
+  const current = await currentStatus(deps, signal);
+  const mutationDeps = serviceMutationDeps(deps, current, signal);
+  if (request.operation === "service-install") {
+    const payload = request.payload as ServiceInstallPayload;
+    return runDesktopServiceMutation("install", {
+      runtimeManifestId: payload.runtimeManifestId,
+      backend: payload.backend,
+    }, { ...mutationDeps, backend: payload.backend });
+  }
+  if (request.operation === "service-repair") {
+    const payload = request.payload as ServiceRepairPayload;
+    return runDesktopServiceMutation("repair", { runtimeManifestId: payload.runtimeManifestId }, mutationDeps);
+  }
+  if (request.operation === "service-start") {
+    return runDesktopServiceMutation("start", {}, mutationDeps);
+  }
+  return runDesktopServiceMutation("uninstall", {}, mutationDeps);
 }
 
 export function createBridgeHandler(deps: BridgeHandlerDeps = {}) {
@@ -700,6 +940,7 @@ export function createBridgeHandler(deps: BridgeHandlerDeps = {}) {
       case "service-start":
       case "service-repair":
       case "service-uninstall":
+        return handleServiceMutation(resolved, request, signal);
       case "legacy-tray-uninstall":
         return errorOutcome(
           "unsupported_operation",

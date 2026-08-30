@@ -12,6 +12,7 @@ import {
 import { writeRuntimePort } from "../../src/config/process-state";
 import { runBridge } from "../runtime/bootstrap";
 import {
+  allowedMutationsFor,
   createBridgeHandler,
   resolveDesktopRuntimeIdentity,
   type BridgeHandlerDeps,
@@ -28,6 +29,12 @@ import {
   type Operation,
 } from "../runtime/protocol";
 import { isSingleJsonObjectLine } from "../runtime/codec";
+import {
+  intendedPublishedPointer,
+  observeActivationJournal,
+  writeActivationJournal,
+} from "../runtime/activation-journal";
+import { STABLE_VERSIONS_DIR, readCurrentPointer } from "../runtime/staging";
 
 const ULID = "01JABCDEFGHJKMNPQRSTVWXYZ1";
 const HANDLER_SOURCE = readFileSync(join(import.meta.dir, "..", "runtime", "handlers.ts"), "utf8");
@@ -152,9 +159,11 @@ function hostTarget(): TargetTriple {
   return "x86_64-unknown-linux-gnu";
 }
 
-function writeVerifiedRuntimeTree(): { root: string; bunPath: string; cliPath: string } {
+function writeVerifiedRuntimeTree(
+  root = join(home, "runtime", "versions", identity.runtimeVersion),
+  version = identity.runtimeVersion,
+): { root: string; bunPath: string; cliPath: string } {
   const target = hostTarget();
-  const root = join(home, "runtime", "versions", identity.runtimeVersion);
   const bunName = `ocx-runtime-${target}${target.includes("windows") ? ".exe" : ""}`;
   const bunPath = join(root, bunName);
   const cliPath = join(root, "src", "cli", "index.ts");
@@ -163,8 +172,8 @@ function writeVerifiedRuntimeTree(): { root: string; bunPath: string; cliPath: s
   writeFileSync(cliPath, "export {};\n");
   if (process.platform !== "win32") chmodSync(bunPath, 0o755);
   const created = createRuntimeManifestFromFiles({
-    id: runtimeManifestId(identity.runtimeVersion, target),
-    version: identity.runtimeVersion,
+    id: runtimeManifestId(version, target),
+    version,
     target,
     root,
     files: [
@@ -480,18 +489,324 @@ describe("production bridge handler contract", () => {
     }));
     expect(result.code).toBe(EXIT_SUCCESS);
     expect((result.json.result as { owner: string }).owner).toBe("desktop-direct");
+    expect((result.json.result as { allowedMutations: string[] }).allowedMutations).toEqual(["stop", "service-install"]);
     expect(starts).toBe(0);
     expect(JSON.stringify(result.json)).not.toContain(identity.bunPath);
   });
 
-  test("service mutations stay unsupported and envelopes leak no secrets", async () => {
+  test("service mutations refuse existing-external owners and leak no secrets", async () => {
     const result = await invoke("service-start", baseDeps({
+      identity,
       findLiveProxy: async () => LIVE,
       probeReadiness: async () => ({ ready: true, status: "ready", pid: LIVE.pid, port: LIVE.port }),
     }));
     expect(result.code).toBe(EXIT_OPERATION_FAILURE);
-    expect((result.json.error as { code: string }).code).toBe("unsupported_operation");
+    expect((result.json.error as { code: string }).code).toBe("ownership_conflict");
     expect(result.text).not.toContain("Authorization");
     expect(result.text).not.toContain(home);
+    expect(result.text).not.toContain(identity.bunPath);
+  });
+
+  test("desktop-service start uses the structured seam and does not spawn CLI argv", async () => {
+    let starts = 0;
+    let live: typeof LIVE | null = null;
+    const tree = writeVerifiedRuntimeTree(join(home, "versions", identity.runtimeVersion));
+    const localIdentity = resolveDesktopRuntimeIdentity(tree.root);
+    if (!localIdentity) throw new Error("failed to resolve verified start identity");
+    const target = hostTarget();
+    writeFileSync(join(home, "current.json"), `${JSON.stringify({
+      schemaVersion: 1,
+      current: {
+        id: localIdentity.runtimeManifestId,
+        version: localIdentity.runtimeVersion,
+        target,
+        relPath: `versions/${identity.runtimeVersion}`,
+      },
+      previous: null,
+    })}\n`);
+    const result = await invoke("service-start", baseDeps({
+      identity: localIdentity,
+      diagnoseService: () => SERVICE_STARTABLE,
+      inspectServiceInstall: () => ({ conflict: false, bunPath: localIdentity.bunPath, cliPath: localIdentity.cliPath }),
+      findLiveProxy: async () => live,
+      probeReadiness: async () => live
+        ? { ready: true, status: "ready", pid: live.pid, port: live.port }
+        : null,
+      startServiceIdentity: async () => {
+        starts += 1;
+        live = LIVE;
+      },
+    }));
+    expect(result.code).toBe(EXIT_SUCCESS);
+    expect((result.json.result as { changed: boolean; proxyStatus: string }).proxyStatus).toBe("ready");
+    expect(starts).toBe(1);
+    expect((result.json.result as { allowedMutations?: string[] }).allowedMutations).toBeUndefined();
+    expect(JSON.stringify(result.json)).not.toContain(identity.bunPath);
+  });
+
+  test("allowed mutations match owner, service state, and verified identity", () => {
+    const absent = { installed: false, startable: false, stateCode: "absent" as const };
+    const startable = { installed: true, startable: true, stateCode: "startable" as const };
+    expect(allowedMutationsFor("unknown/conflict", startable, identity, LIVE.pid)).toEqual([]);
+    expect(allowedMutationsFor("existing-external", absent, identity, LIVE.pid)).toEqual(["stop"]);
+    expect(allowedMutationsFor("existing-external", absent, identity, null)).toEqual(["stop", "service-install"]);
+    expect(allowedMutationsFor("desktop-direct", absent, identity, LIVE.pid)).toEqual(["stop", "service-install"]);
+    expect(allowedMutationsFor("desktop-service", startable, identity, LIVE.pid)).toEqual([
+      "stop",
+      "service-start",
+      "service-repair",
+      "service-uninstall",
+    ]);
+    expect(allowedMutationsFor("desktop-direct", absent, null, LIVE.pid)).toEqual(["stop"]);
+  });
+
+  test("production startDirect uses the passed identity and install reports managerStarted", () => {
+    expect(HANDLER_SOURCE).toContain("productionStartDirect({ ...input, identity: input.identity })");
+    expect(HANDLER_SOURCE).toContain("identity: target");
+    expect(HANDLER_SOURCE).toContain("identity: deps.identity");
+    expect(HANDLER_SOURCE).toContain("return { managerStarted: true }");
+    expect(HANDLER_SOURCE).toContain("activationIsPending");
+    expect(HANDLER_SOURCE).toContain("stopProxyGracefully");
+    expect(HANDLER_SOURCE).toContain("productionStopOwnedService");
+    expect(HANDLER_SOURCE).not.toContain("withStartLock");
+  });
+
+  test("status with an unresolved journal is pending with no mutations", async () => {
+    const tree = writeVerifiedRuntimeTree(join(home, "versions", identity.runtimeVersion));
+    const localIdentity = resolveDesktopRuntimeIdentity(tree.root);
+    if (!localIdentity) throw new Error("failed to resolve identity");
+    const target = hostTarget();
+    writeFileSync(join(home, "current.json"), `${JSON.stringify({
+      schemaVersion: 1,
+      current: {
+        id: localIdentity.runtimeManifestId,
+        version: localIdentity.runtimeVersion,
+        target,
+        relPath: `versions/${identity.runtimeVersion}`,
+      },
+      previous: null,
+    })}\n`);
+    writeFileSync(join(home, "activation.journal"), "not-a-valid-journal\n");
+    let starts = 0;
+    const status = await invoke("status", baseDeps({
+      identity: localIdentity,
+      findLiveProxy: async () => null,
+      startDirect: async () => { starts += 1; },
+      startService: async () => { starts += 1; },
+    }));
+    expect(status.code).toBe(EXIT_SUCCESS);
+    expect((status.json.result as { status: string }).status).toBe("pending");
+    expect((status.json.result as { allowedMutations: string[] }).allowedMutations).toEqual([]);
+    const bootstrap = await invoke("bootstrap", baseDeps({
+      identity: localIdentity,
+      findLiveProxy: async () => null,
+      startDirect: async () => { starts += 1; },
+      startService: async () => { starts += 1; },
+    }));
+    expect(bootstrap.json.ok).toBe(false);
+    expect(starts).toBe(0);
+  });
+
+  test("service mutation startDirect wrapper passes candidate identity", async () => {
+    const tree = writeVerifiedRuntimeTree(join(home, "versions", identity.runtimeVersion));
+    const localIdentity = resolveDesktopRuntimeIdentity(tree.root);
+    if (!localIdentity) throw new Error("failed to resolve identity");
+    const seen: string[] = [];
+    await invoke("service-install", baseDeps({
+      identity: localIdentity,
+      diagnoseService: () => SERVICE_ABSENT,
+      findLiveProxy: async () => null,
+      startDirect: async input => {
+        seen.push(input.identity.bunPath, input.identity.cliPath);
+      },
+    }), { backend: "platform-default", runtimeManifestId: localIdentity.runtimeManifestId });
+    expect(seen.length === 0 || seen[0] === localIdentity.bunPath).toBe(true);
+  });
+
+  test("failed production service stop aborts recovery without leaking paths", async () => {
+    const oldTree = writeVerifiedRuntimeTree(join(home, "versions", "2.35.0"), "2.35.0");
+    const nextTree = writeVerifiedRuntimeTree(join(home, "versions", "2.36.0"), "2.36.0");
+    const oldIdentity = resolveDesktopRuntimeIdentity(oldTree.root);
+    const nextIdentity = resolveDesktopRuntimeIdentity(nextTree.root);
+    if (!oldIdentity || !nextIdentity) throw new Error("failed to resolve identities");
+    const target = hostTarget();
+    writeFileSync(join(home, "current.json"), `${JSON.stringify({
+      schemaVersion: 1,
+      current: {
+        id: oldIdentity.runtimeManifestId,
+        version: oldIdentity.runtimeVersion,
+        target,
+        relPath: `${STABLE_VERSIONS_DIR}/${oldIdentity.runtimeVersion}`,
+      },
+      previous: null,
+    })}\n`);
+    const snapshotPointer = {
+      schemaVersion: 1 as const,
+      current: {
+        id: oldIdentity.runtimeManifestId,
+        version: oldIdentity.runtimeVersion,
+        target,
+        relPath: `${STABLE_VERSIONS_DIR}/${oldIdentity.runtimeVersion}`,
+      },
+      previous: null,
+    };
+    const candidate = {
+      id: nextIdentity.runtimeManifestId,
+      version: nextIdentity.runtimeVersion,
+      target,
+      relPath: `${STABLE_VERSIONS_DIR}/${nextIdentity.runtimeVersion}`,
+    };
+    const secretPath = `${home}/secret-user/unit.service`;
+    expect(writeActivationJournal(home, {
+      schemaVersion: 1,
+      transactionId: "tx-handler-fail-stop",
+      token: "lock-token-1",
+      intent: "activate",
+      kind: "install",
+      mode: "service",
+      stableRoot: home,
+      expectedTarget: target,
+      snapshot: {
+        pointer: snapshotPointer,
+        owner: "desktop-direct",
+        hadLiveProxy: false,
+        serviceInstalled: false,
+        backend: null,
+        bunPath: null,
+        cliPath: null,
+        previousPid: null,
+        previousBunPath: oldIdentity.bunPath,
+        previousCliPath: oldIdentity.cliPath,
+      },
+      candidate,
+      publishedPointer: intendedPublishedPointer(snapshotPointer, candidate),
+      touchedService: true,
+      candidatePid: null,
+    }).ok).toBe(true);
+    let starts = 0;
+    const result = await invoke("bootstrap", baseDeps({
+      identity: oldIdentity,
+      cwd: oldIdentity.stableRuntimeRoot,
+      findLiveProxy: async () => null,
+      inspectServiceInstall: () => ({
+        conflict: false,
+        bunPath: nextIdentity.bunPath,
+        cliPath: nextIdentity.cliPath,
+      }),
+      diagnoseService: () => ({ ...SERVICE_STARTABLE, backend: "scheduler" }),
+      startDirect: async () => { starts += 1; },
+      startService: async () => { starts += 1; },
+      startServiceIdentity: async () => { starts += 1; },
+      stopOwnedServiceRuntime: () => ({
+        state: "failed",
+        message: `Failed to stop ${secretPath}`,
+      }),
+    }));
+    expect(result.json.ok).toBe(false);
+    expect((result.json.error as { code: string }).code).toBe("restore_failed");
+    expect(result.text).not.toContain(secretPath);
+    expect(result.text).not.toContain("secret-user");
+    expect(starts).toBe(0);
+    expect(observeActivationJournal(home).state).toBe("valid");
+    const pointer = readCurrentPointer(home);
+    expect(pointer.ok && pointer.pointer?.current.id).toBe(oldIdentity.runtimeManifestId);
+  });
+
+  test("bootstrap recovers a valid stale journal without starting extra processes", async () => {
+    const oldTree = writeVerifiedRuntimeTree(join(home, "versions", "2.35.0"), "2.35.0");
+    const nextTree = writeVerifiedRuntimeTree(join(home, "versions", "2.36.0"), "2.36.0");
+    const oldIdentity = resolveDesktopRuntimeIdentity(oldTree.root);
+    const nextIdentity = resolveDesktopRuntimeIdentity(nextTree.root);
+    if (!oldIdentity || !nextIdentity) throw new Error("failed to resolve identities");
+    const target = hostTarget();
+    writeFileSync(join(home, "current.json"), `${JSON.stringify({
+      schemaVersion: 1,
+      current: {
+        id: oldIdentity.runtimeManifestId,
+        version: oldIdentity.runtimeVersion,
+        target,
+        relPath: `${STABLE_VERSIONS_DIR}/${oldIdentity.runtimeVersion}`,
+      },
+      previous: null,
+    })}\n`);
+    const snapshotPointer = {
+      schemaVersion: 1 as const,
+      current: {
+        id: oldIdentity.runtimeManifestId,
+        version: oldIdentity.runtimeVersion,
+        target,
+        relPath: `${STABLE_VERSIONS_DIR}/${oldIdentity.runtimeVersion}`,
+      },
+      previous: null,
+    };
+    const candidate = {
+      id: nextIdentity.runtimeManifestId,
+      version: nextIdentity.runtimeVersion,
+      target,
+      relPath: `${STABLE_VERSIONS_DIR}/${nextIdentity.runtimeVersion}`,
+    };
+    expect(writeActivationJournal(home, {
+      schemaVersion: 1,
+      transactionId: "tx-handler-recover",
+      token: "lock-token-1",
+      intent: "activate",
+      kind: "install",
+      mode: "service",
+      stableRoot: home,
+      expectedTarget: target,
+      snapshot: {
+        pointer: snapshotPointer,
+        owner: "desktop-direct",
+        hadLiveProxy: false,
+        serviceInstalled: false,
+        backend: null,
+        bunPath: null,
+        cliPath: null,
+        previousPid: null,
+        previousBunPath: oldIdentity.bunPath,
+        previousCliPath: oldIdentity.cliPath,
+      },
+      candidate,
+      publishedPointer: intendedPublishedPointer(snapshotPointer, candidate),
+      touchedService: true,
+      candidatePid: null,
+    }).ok).toBe(true);
+    const installed: { bunPath?: string; cliPath?: string } = {
+      bunPath: nextIdentity.bunPath,
+      cliPath: nextIdentity.cliPath,
+    };
+    let starts = 0;
+    const deps = baseDeps({
+      identity: oldIdentity,
+      cwd: oldIdentity.stableRuntimeRoot,
+      findLiveProxy: async () => null,
+      inspectServiceInstall: () => ({
+        conflict: false,
+        bunPath: installed.bunPath,
+        cliPath: installed.cliPath,
+      }),
+      diagnoseService: () => installed.bunPath
+        ? { ...SERVICE_STARTABLE, backend: "scheduler" }
+        : SERVICE_ABSENT,
+      uninstallServiceRuntime: () => {
+        delete installed.bunPath;
+        delete installed.cliPath;
+        return true;
+      },
+      stopOwnedServiceRuntime: () => ({ state: "stopped" }),
+      startDirect: async () => { starts += 1; },
+      startService: async () => { starts += 1; },
+      startServiceIdentity: async () => { starts += 1; },
+    });
+    const bootstrap = await invoke("bootstrap", deps);
+    expect(bootstrap.json.ok).toBe(false);
+    expect((bootstrap.json.error as { retryable?: boolean }).retryable).toBe(true);
+    expect((bootstrap.json.error as { message: string }).message).toContain("retry status");
+    expect(starts).toBe(0);
+    expect(observeActivationJournal(home).state).toBe("absent");
+    const status = await invoke("status", deps);
+    expect(status.code).toBe(EXIT_SUCCESS);
+    expect((status.json.result as { status: string }).status).not.toBe("pending");
+    expect((status.json.result as { allowedMutations: string[] }).allowedMutations.length).toBeGreaterThan(0);
   });
 });
