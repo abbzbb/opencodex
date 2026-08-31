@@ -125,19 +125,20 @@ Rust 不重写 `findLiveProxy`、PID 身份、service 诊断、端口选择或 r
 wire contract：
 
 - bridge 以固定 argv 启动，只从 stdin 读取一个 UTF-8 JSON object；请求不得进入 argv、URL 或环境变量。请求是 discriminated object：`{ schemaVersion: 1, requestId, operation, payload }`。`requestId` 为最多 64 字节的 ASCII UUID/ULID；所有字段必填，缺失/未知字段、未知 operation、错误 payload 类型或不支持的版本均在任何副作用前返回 `protocol_mismatch`。
-- `bootstrap`、`status`、`service-start`、`service-uninstall`、`legacy-tray-uninstall` 的 payload 固定为 `{}`；`stop` 为 `{ reason: "app-exit" | "update" | "uninstall" }`；`service-install` 为 `{ backend: "platform-default" | "windows-native", runtimeManifestId }`；`service-repair` 为 `{ runtimeManifestId }`。`runtimeManifestId` 只能匹配已 stage 并通过 hash 校验的 manifest id，由 bridge 在 stable root 内解析，Rust 不能传绝对路径。
+- `bootstrap`、`status`、`service-start`、`service-uninstall`、`legacy-tray-uninstall` 的 payload 固定为 `{}`；`stop` 为 `{ reason: "app-exit" | "update" | "uninstall" }`；`runtime-activate` 与 `service-repair` 为 `{ runtimeManifestId }`；`service-install` 为 `{ backend: "platform-default" | "windows-native", runtimeManifestId }`。`runtimeManifestId` 只能匹配已 stage 并通过 hash 校验的 manifest id，由 bridge 在 stable root 内解析，Rust 不能传绝对路径。
 - Rust 每次只发送上述固定 request；bridge stdout 只能输出一个 UTF-8 JSON object 加换行，禁止进度行、ANSI 和多 envelope。
 - 所有 response envelope 固定含 `schemaVersion: 1`、原样 `requestId`、`operation` 和 `ok`。成功增加 `result`；失败增加 `error: { code, message, retryable }`，且不得同时出现 `result`。
 - error code 至少稳定定义 `protocol_mismatch`、`unsupported_operation`、`deadline_exceeded`、`service_not_startable`、`ownership_conflict`、`proxy_not_ready`、`stop_failed`、`restore_failed`、`runtime_integrity_failed`。
 - bridge 自身 exit code：0=成功 envelope，1=操作失败 envelope，2=协议/参数错误。Rust 同时校验 exit code、schema、requestId 和 envelope；任一不一致视为 `bridge_protocol_error`。
 - core CLI/函数的 stdout/stderr 必须重定向到有界捕获或 Desktop 日志；bridge stdout 不能透传 `ocx stop/service` 的人类文本。日志写入前沿用隐私过滤，最多保留 64 KiB/次，Rust 不从日志推断结果。
-- deadline 由 Rust 和 bridge 同时执行：`status` 10 秒，`bootstrap`/`stop` 90 秒，service/tray mutation 120 秒。超时只终止短生命周期 bridge；不得直接 kill 已启动的代理。mutation 超时视为 outcome unknown，必须先用新 `status` request 对账，禁止盲目重放。
+- bridge handler deadline：`status` 10 秒，`bootstrap`/`stop` 90 秒，runtime/service/tray mutation 120 秒。`runtime-activate` 在 abort 后最多再等 10 秒做 best-effort transaction cleanup，Rust process watchdog 为 135 秒，避免与 bridge deadline 同时竞速；cleanup 仍继承已 abort 的 signal，不保证当次 rollback/recovery 完成，未决 journal 由下一次 bootstrap 恢复。其他 operation 的 Rust watchdog 与各自 bridge deadline 相同。超时只终止短生命周期 bridge；不得直接 kill 已启动的代理。mutation 的 bridge failure envelope 与 Rust watchdog timeout 都视为 outcome unknown，统一先重读 candidate/previous pointer、从该 current 重新解析 bridge、用新 `status` 对账 owner/version/readiness 并再次比较 pointer，禁止盲目重放 activation。
 
 封闭操作枚举：
 
 - `bootstrap`：找现有代理。service 为 `installed+startable` 时启动/等待 service；为 `installed+not-startable` 或 ownership conflict 时返回稳定错误且禁止 direct；仅在 service 未安装时启动一次 App-owned direct proxy。最后等待 `findLiveProxy` + `probeReadiness` 对同一 PID/端口成功。
 - `status`：返回当前身份、origin、版本、service 可用性和所有权，不返回路径外的敏感状态。证据冲突时仍返回成功 envelope，`result.owner` 为 `unknown/conflict` 并附 `allowedMutations: []`；`bootstrap` 和 mutation operation 遇到同一状态则返回 `ownership_conflict`。
 - `stop`：调用与 CLI 共用的结构化 stop transaction，等待身份校验后的“代理不存在”，并返回 stop/restore/ownership 结果。
+- `runtime-activate`：只对已证明且在 preflight `allowedMutations` 中显式声明该 capability 的 `desktop-direct` 开放。Rust 只传 staged manifest id；bridge 固定走 direct activation transaction，在锁内复验 owner/current/manifest/install-id，stop old、从候选绝对路径启动并复验 child records/`/readyz` 后 CAS 提交；失败从旧绝对路径恢复。`existing-external`、`desktop-service`、`unknown/conflict` 以及不声明 capability 的旧开发 generation 在任何 stop 前拒绝。本功能进入首个公开 Desktop 版本前没有公开兼容 generation；此前开发包不承诺原地升级。
 - `service-install`、`service-start`、`service-repair`、`service-uninstall`：只接受上述预定义 payload；repair/uninstall 仅对已证明的 `desktop-service` 开放。
 - `legacy-tray-uninstall`：只调用现有固定 tray uninstall，且只在用户已确认的第 2 期迁移事务中使用。
 
@@ -148,6 +149,7 @@ result union 同样封闭并拒绝未知字段：
 | `bootstrap` | `{ status: "ready", origin, pid, version, owner, service, allowedMutations }` |
 | `status` | `{ status: "ready" | "pending" | "stopped" | "failed", origin: string | null, pid: number | null, version: string | null, owner, service, allowedMutations }` |
 | `stop` | 下述 `StopTransactionResult`，不得降格为单一 boolean |
+| `runtime-activate` | `{ changed, service, proxyStatus }`；不返回绝对路径、owner record 或 token |
 | `service-*` | `{ changed, service, proxyStatus }`；不返回绝对路径或 token |
 | `legacy-tray-uninstall` | `{ changed }` |
 
@@ -299,7 +301,7 @@ bridge 只有在以下证据全部一致时才认定 `desktop-direct`：PID 通�
 
 ### 第 1 期：功能 MVP 窗口与托盘
 
-当前进度（2026-08-31）：Tauri 工程、共享 start/stop/owner seam、v1 bridge、窗口/托盘/single-instance 骨架、target-native runtime payload builder，以及 packaged resource 到 per-user stable runtime 的首次启动接线已落地。builder 在目标主机用 Bun `--production --frozen-lockfile --ignore-scripts` 生成闭包，只保留匹配 target 的 Bun/keyring 原生包，最后写入并复验 manifest；release `build.rs` 在没有真实 payload 时拒绝继续。App 启动先通过独立固定 argv 的 `desktop/runtime/install.ts` 校验并部署资源：无 `current` 时原子发布，同版本仅在规范化 manifest 完全一致时复用，已有不同 `current` 时只 stage 候选而不提前切换。中断遗留的临时 staging 树由下一次成功持锁的部署清理；版本树保留到具备 service/PID 所有权证据的更新事务。Linux x64 `.deb` 已通过解包资源布局探针和真实 `dpkg` 安装后 Probe B（`desktop-direct` + 严格 `/readyz` + structured stop + `dpkg -r`）。探针 C 的确定性事务基础已落地（owner-only checksum journal、activation.lock、verified stable 解析、精确 service 路径、stop → install/repair → start → 严格 ready → 完整 `current.json` CAS、partial cleanup、三代 B/A rollback、post-image finalize/rollback、successor/PID fail-closed、`canRespawn` 规范 absence window）；证据见 `desktop/probes/probe-c-service-runtime-transaction.md`。该证据全部使用注入的 service manager fake/seam，不是物理 launchd / Task Scheduler / WinSW / systemd smoke。探针 C 仍 OPEN：须在 macOS launchd、Windows scheduler/WinSW、Linux `.deb` systemd 上完成真实 service smoke，并接线/证明生产 desktop-direct 存活复认与更新路径。service-path 与 global-stop 的 shared-lock 竞态仍为 WATCH。尚未完成的是 WebView/session/CSRF/导航 smoke，以及其他平台与 service/update/deep-link 后续期。
+当前进度（2026-08-31）：Tauri 工程、共享 start/stop/owner seam、v1 bridge、窗口/托盘/single-instance 骨架、target-native runtime payload builder，以及 packaged resource 到 per-user stable runtime 的首次启动接线已落地。builder 在目标主机用 Bun `--production --frozen-lockfile --ignore-scripts` 生成闭包，只保留匹配 target 的 Bun/keyring 原生包，最后写入并复验 manifest；release `build.rs` 在没有真实 payload 时拒绝继续。App 启动先通过独立固定 argv 的 `desktop/runtime/install.ts` 校验并部署资源：无 `current` 时原子发布，同版本仅在规范化 manifest 完全一致时复用，已有不同 `current` 时只 stage 候选而不提前切换。已有 current 时，Rust 先从旧 generation bootstrap/reconcile，避免未恢复 journal 阻断 staging；若新候选与 current 不同、owner 为 `desktop-direct` 且旧 generation 声明 `runtime-activate` capability，Rust 从旧 bridge 发固定请求。事务成功后精确复验 `current=new/previous=old`，重新解析新 bridge 并再次 bootstrap。external/service 候选保持 staged，不走 direct stop；bridge timeout envelope 与 Rust watchdog timeout 统一先检查 candidate/previous post-image，从该 current 重新解析 bridge 并核对 owner/version/readiness，再双读 pointer，绝不重放 activation。中断遗留的临时 staging 树由下一次成功持锁的部署清理；版本树保留到具备 service/PID 所有权证据的更新事务。Linux x64 `.deb` 已通过解包资源布局探针和真实 `dpkg` 安装后 Probe B（`desktop-direct` + 严格 `/readyz` + structured stop + `dpkg -r`）。探针 C 的确定性事务基础与 production bridge 接线已落地（owner-only checksum journal、activation.lock、verified stable 解析、精确 service 路径、stop → install/repair/direct activate → start → 严格 ready → 完整 `current.json` CAS、partial cleanup、三代 B/A rollback、post-image finalize/rollback、successor/PID fail-closed、`canRespawn` 规范 absence window）；证据见 `desktop/probes/probe-c-service-runtime-transaction.md`。当前证据仍以注入的 service/process seam 为主，不是物理 launchd / Task Scheduler / WinSW / systemd 或真实 packaged old/new child smoke。探针 C 仍 OPEN：须在 macOS launchd、Windows scheduler/WinSW、Linux `.deb` systemd 上完成真实 service smoke，并用真实子进程证明 shell crash 后 survivor 复认及 old-to-new/failed-update 回旧绝对路径。service-path 与 global-stop 的 shared-lock 竞态仍为 WATCH。尚未完成的是 WebView/session/CSRF/导航 smoke，以及其他平台与 service/update/deep-link 后续期。
 
 工作项：
 

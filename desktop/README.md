@@ -146,11 +146,21 @@ Deterministic Probe C transaction foundation is implemented
 checksummed owner-only journal, cross-process activation lock, verified stable
 resolution, exact service paths, stop / install-or-repair / start / strict
 ready / full-pointer publish, rollback, and the canonical `canRespawn` absence
-window. Service managers in that evidence are fakes/seams, not physical platform
-smoke. Probe C remains OPEN until macOS launchd, Windows scheduler/WinSW, Linux
-`.deb` systemd service smoke, and the production desktop-direct survivor/update
-path are wired and proven. The service-path / global-stop shared-lock race
-remains WATCH.
+window. The production shell now preflights the old generation before staging,
+issues a closed `runtime-activate` request only for a proven `desktop-direct`,
+verifies the committed new/previous pointer, and bootstraps again from the new
+generation. The old generation must advertise that operation in
+`allowedMutations`; pre-feature development packages have no in-place upgrade
+compatibility promise. Timeout envelopes and process-watchdog timeouts both
+reconcile through the bridge selected by the observed current pointer and
+require owner/version/readiness plus a second pointer read. Cleanup after abort
+is best-effort; a pending durable journal is recovered by the next bootstrap
+rather than treated as a completed rollback. Service/process managers in this
+evidence are fakes/seams, not
+physical platform or packaged old/new child smoke. Probe C remains OPEN until
+macOS launchd, Windows scheduler/WinSW, Linux `.deb` systemd service smoke, and
+real-process survivor/update/rollback evidence are complete. The service-path /
+global-stop shared-lock race remains WATCH.
 
 Neither Linux `.deb` probe is WebView, session/CSRF, or navigation evidence.
 The post-install probe directly asserted no Codex CLI and checked the full

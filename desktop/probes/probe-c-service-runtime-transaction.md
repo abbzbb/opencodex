@@ -10,10 +10,10 @@ Date: 2026-08-31
 - Service managers in this evidence are **injected fakes/seams**, not physical
   launchd, Task Scheduler, WinSW, or systemd processes
 
-This records the deterministic transaction foundation for PLAN Probe C. It does
-not close Probe C. Physical macOS launchd, Windows scheduler/WinSW, Linux `.deb`
-systemd service smoke, and the production desktop-direct survivor/update path
-remain unwired/unproven.
+This records the deterministic transaction foundation and production bridge
+wiring for PLAN Probe C. It does not close Probe C. Physical macOS launchd,
+Windows scheduler/WinSW, Linux `.deb` systemd service smoke, and real packaged
+desktop-direct survivor/update processes remain unproven.
 
 ## Commands
 
@@ -24,6 +24,16 @@ bun run typecheck
 bun run typecheck:desktop
 
 bun run test -- ./desktop/tests/service-activation.test.ts
+bun run test -- \
+  ./desktop/tests/codec.test.ts \
+  ./desktop/tests/protocol.test.ts \
+  ./desktop/tests/deadline.test.ts \
+  ./desktop/tests/handlers.test.ts \
+  ./desktop/tests/service-activation.test.ts
+
+cargo test --manifest-path desktop/src-tauri/Cargo.toml
+
+bun test ./desktop/tests
 
 bun run test -- \
   ./desktop/tests/activation-journal.test.ts \
@@ -46,6 +56,9 @@ read or recorded.
 - `bun run typecheck:desktop`: exit `0`
 - `desktop/tests/service-activation.test.ts`: `71` pass / `0` fail / `431` expects
 - Remaining focused files above (`9` files): `254` pass / `0` fail / `1101` expects
+- Production runtime activation focused files (`5` files): `143` pass / `0` fail / `981` expects
+- Full Desktop suite: `243` pass / `0` fail / `1555` expects
+- Tauri Rust unit tests: `45` pass / `0` fail
 
 ## Observed deterministic behavior
 
@@ -98,6 +111,20 @@ unless an item names a real OS process.
   or valid/unreadable journal as pending and does not recover. `bootstrap`
   acquires the activation lock and recovers a valid stale journal without extra
   starts. Staging/install refuses to publish around an unresolved journal.
+- **Production direct activation wiring.** With an existing current generation,
+  Rust bootstraps/reconciles the old bridge before packaged staging. A distinct
+  staged candidate is sent back to that old bridge only as a verified manifest
+  id through `runtime-activate` after the old generation advertises that closed
+  capability; the handler hard-codes direct mode and rejects
+  external/service/conflict owners before stop. Success requires the bridge
+  transaction to report ready plus an exact Rust re-read of
+  `current=candidate, previous=old`, followed by bridge resolution and bootstrap
+  from the new generation. Both bridge timeout envelopes and Rust watchdog
+  timeouts inspect the candidate/previous post-image, resolve the bridge from
+  that observed current, require matching owner/version/readiness, and compare
+  the pointer again. The bridge allows a bounded best-effort abort-cleanup
+  grace; cleanup still sees the aborted operation signal, so an unresolved
+  journal is recovered by the next bootstrap. Activation is never replayed.
 
 ## Evidence boundary
 
@@ -108,9 +135,10 @@ platform service smoke and does not prove:
 - macOS launchd install/crash-restart/repair/rollback
 - Windows Task Scheduler or WinSW
 - Linux `.deb` systemd user service
-- production desktop-direct survivor re-attest after a real shell crash
-- production old-to-new desktop-direct update and failed-update restart from
-  the previous absolute paths
+- packaged desktop-direct survivor re-attest after a real shell crash
+- real-child old-to-new desktop-direct update and failed-update restart from
+  the previous absolute paths (the production bridge path is wired; current
+  deterministic child/service effects are injected seams)
 - WebView, session/CSRF, navigation, tray, single-instance, signing, or
   autoupdate
 

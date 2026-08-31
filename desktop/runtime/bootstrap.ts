@@ -2,6 +2,7 @@ import { decodeStdin, encodeEnvelope, MAX_REQUEST_BYTES } from "./codec";
 import { createBridgeHandler } from "./handlers";
 import { sanitizeLogMetadataString } from "../../src/lib/redact";
 import {
+  cleanupGraceMsFor,
   deadlineExceededError,
   DeadlineExceededError,
   deadlineMsFor,
@@ -269,13 +270,15 @@ export async function runBridge(options: RunBridgeOptions = {}): Promise<number>
   const deadlineMs = deadlineMsFor(request.operation);
   let outcome: HandlerOutcome;
   try {
-    outcome = await withDeadline(deadlineMs, async (signal) =>
-      invokeHandlerCaptured(
+    outcome = await withDeadline(
+      deadlineMs,
+      async (signal) => invokeHandlerCaptured(
         handler,
         request,
         { signal, deadlineMs },
         options.onHandlerOutput,
       ),
+      cleanupGraceMsFor(request.operation),
     );
   } catch (error) {
     if (isDeadlineExceededError(error) || error instanceof DeadlineExceededError) {

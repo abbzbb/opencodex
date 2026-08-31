@@ -187,6 +187,55 @@ function writeVerifiedRuntimeTree(
   return { root, bunPath, cliPath };
 }
 
+function prepareDirectActivationStore(): {
+  stableRoot: string;
+  oldIdentity: DesktopRuntimeIdentity;
+  nextIdentity: DesktopRuntimeIdentity;
+} {
+  const stableRoot = join(home, "runtime");
+  const oldTree = writeVerifiedRuntimeTree(
+    join(stableRoot, STABLE_VERSIONS_DIR, "2.35.0"),
+    "2.35.0",
+  );
+  const nextTree = writeVerifiedRuntimeTree(
+    join(stableRoot, STABLE_VERSIONS_DIR, "2.36.0"),
+    "2.36.0",
+  );
+  const oldIdentity = resolveDesktopRuntimeIdentity(oldTree.root);
+  const nextIdentity = resolveDesktopRuntimeIdentity(nextTree.root);
+  if (!oldIdentity || !nextIdentity) throw new Error("failed to resolve activation identities");
+  const target = hostTarget();
+  writeFileSync(join(stableRoot, "current.json"), `${JSON.stringify({
+    schemaVersion: 1,
+    current: {
+      id: oldIdentity.runtimeManifestId,
+      version: oldIdentity.runtimeVersion,
+      target,
+      relPath: `${STABLE_VERSIONS_DIR}/${oldIdentity.runtimeVersion}`,
+    },
+    previous: null,
+  })}\n`);
+  return { stableRoot, oldIdentity, nextIdentity };
+}
+
+function publishDirectOwner(identity: DesktopRuntimeIdentity, pid: number): void {
+  const ownerId = "0123456789abcdef0123456789abcdef";
+  publishDesktopDirectOwnerRecord({
+    schemaVersion: 1,
+    ownerId,
+    installId: identity.installId,
+    runtimeManifestId: identity.runtimeManifestId,
+    runtimeVersion: identity.runtimeVersion,
+    bunPath: identity.bunPath,
+    cliPath: identity.cliPath,
+    pid,
+    nonceDigest: digestLaunchNonce("ab".repeat(32)),
+    createdAt: Date.now() - 60_000,
+  });
+  writeRuntimePort({ pid, port: LIVE.port, hostname: LIVE.hostname });
+  writeRuntimePortOwnerId(ownerId, pid);
+}
+
 describe("production bridge handler contract", () => {
   test("derives identity only from a hash-verified stable runtime generation", () => {
     const tree = writeVerifiedRuntimeTree();
@@ -489,7 +538,11 @@ describe("production bridge handler contract", () => {
     }));
     expect(result.code).toBe(EXIT_SUCCESS);
     expect((result.json.result as { owner: string }).owner).toBe("desktop-direct");
-    expect((result.json.result as { allowedMutations: string[] }).allowedMutations).toEqual(["stop", "service-install"]);
+    expect((result.json.result as { allowedMutations: string[] }).allowedMutations).toEqual([
+      "stop",
+      "service-install",
+      "runtime-activate",
+    ]);
     expect(starts).toBe(0);
     expect(JSON.stringify(result.json)).not.toContain(identity.bunPath);
   });
@@ -505,6 +558,178 @@ describe("production bridge handler contract", () => {
     expect(result.text).not.toContain("Authorization");
     expect(result.text).not.toContain(home);
     expect(result.text).not.toContain(identity.bunPath);
+  });
+
+  test("runtime-activate fails closed for external, service, and conflicting owners before side effects", async () => {
+    const cases: Array<{ name: string; deps: BridgeHandlerDeps }> = [
+      {
+        name: "external",
+        deps: {
+          findLiveProxy: async () => LIVE,
+          diagnoseService: () => SERVICE_ABSENT,
+        },
+      },
+      {
+        name: "service",
+        deps: {
+          findLiveProxy: async () => LIVE,
+          diagnoseService: () => SERVICE_STARTABLE,
+          inspectServiceInstall: () => ({
+            conflict: false,
+            bunPath: identity.bunPath,
+            cliPath: identity.cliPath,
+          }),
+        },
+      },
+      {
+        name: "conflict",
+        deps: {
+          findLiveProxy: async () => LIVE,
+          diagnoseService: () => SERVICE_CONFLICT,
+        },
+      },
+    ];
+    for (const item of cases) {
+      let sideEffects = 0;
+      const result = await invoke("runtime-activate", baseDeps({
+        identity,
+        ...item.deps,
+        runStopTransaction: async () => {
+          sideEffects += 1;
+          throw new Error("must not stop");
+        },
+        startDirect: async () => { sideEffects += 1; },
+        repairServiceRuntime: async () => { sideEffects += 1; },
+      }), { runtimeManifestId: identity.runtimeManifestId });
+      expect(result.code, item.name).toBe(EXIT_OPERATION_FAILURE);
+      expect((result.json.error as { code: string }).code, item.name).toBe("ownership_conflict");
+      expect(sideEffects, item.name).toBe(0);
+    }
+  });
+
+  test("runtime-activate uses direct mode and publishes a ready candidate", async () => {
+    const { stableRoot, oldIdentity, nextIdentity } = prepareDirectActivationStore();
+    const oldPid = LIVE.pid;
+    publishDirectOwner(oldIdentity, oldPid);
+    let activeIdentity = oldIdentity;
+    let live: typeof LIVE | null = { ...LIVE, pid: oldPid, version: oldIdentity.runtimeVersion };
+    const starts: string[] = [];
+    let stops = 0;
+    let repairs = 0;
+    const result = await invoke("runtime-activate", baseDeps({
+      identity: oldIdentity,
+      cwd: oldIdentity.stableRuntimeRoot,
+      findLiveProxy: async () => live,
+      readCommandLine: () => `${activeIdentity.bunPath} ${activeIdentity.cliPath} start`,
+      isAlive: pid => live?.pid === pid,
+      probeReadiness: async (_port, opts) => live && opts.expectedPid === live.pid
+        ? { ready: true, status: "ready", pid: live.pid, port: live.port }
+        : null,
+      runStopTransaction: async () => {
+        stops += 1;
+        live = null;
+        return {
+          ok: true,
+          code: "stopped",
+          serviceStopped: false,
+          proxyStopped: true,
+          proxyAbsent: true,
+          restoreStatus: "not-needed",
+          grokStatus: "not-needed",
+          events: [],
+        };
+      },
+      startDirect: async input => {
+        starts.push(input.identity.runtimeVersion);
+        activeIdentity = input.identity;
+        live = { ...LIVE, pid: 5252, version: input.identity.runtimeVersion };
+        publishDirectOwner(input.identity, live.pid);
+      },
+      repairServiceRuntime: async () => { repairs += 1; },
+    }), { runtimeManifestId: nextIdentity.runtimeManifestId });
+    expect(result.code).toBe(EXIT_SUCCESS);
+    expect(result.json.ok).toBe(true);
+    expect(result.json.result).toMatchObject({ changed: true, proxyStatus: "ready" });
+    expect(stops).toBe(1);
+    expect(starts).toEqual([nextIdentity.runtimeVersion]);
+    expect(repairs).toBe(0);
+    const pointer = readCurrentPointer(stableRoot);
+    expect(pointer.ok && pointer.pointer?.current.id).toBe(nextIdentity.runtimeManifestId);
+  });
+
+  test("runtime-activate reuses direct transaction rollback after candidate readiness failure", async () => {
+    const { stableRoot, oldIdentity, nextIdentity } = prepareDirectActivationStore();
+    publishDirectOwner(oldIdentity, LIVE.pid);
+    let activeIdentity = oldIdentity;
+    let live: typeof LIVE | null = { ...LIVE, version: oldIdentity.runtimeVersion };
+    const starts: string[] = [];
+    let repairs = 0;
+    const result = await invoke("runtime-activate", baseDeps({
+      identity: oldIdentity,
+      cwd: oldIdentity.stableRuntimeRoot,
+      findLiveProxy: async () => live,
+      readCommandLine: () => `${activeIdentity.bunPath} ${activeIdentity.cliPath} start`,
+      isAlive: pid => live?.pid === pid,
+      probeReadiness: async (_port, opts) => {
+        if (!live || opts.expectedPid !== live.pid) return null;
+        if (live.version === nextIdentity.runtimeVersion) {
+          return { ready: false, status: "failed", pid: live.pid, port: live.port };
+        }
+        return { ready: true, status: "ready", pid: live.pid, port: live.port };
+      },
+      runStopTransaction: async () => {
+        live = null;
+        return {
+          ok: true,
+          code: "stopped",
+          serviceStopped: false,
+          proxyStopped: true,
+          proxyAbsent: true,
+          restoreStatus: "not-needed",
+          grokStatus: "not-needed",
+          events: [],
+        };
+      },
+      stopOwnedLiveRuntime: () => { live = null; },
+      startDirect: async input => {
+        starts.push(input.identity.runtimeVersion);
+        activeIdentity = input.identity;
+        live = {
+          ...LIVE,
+          pid: input.identity.runtimeVersion === nextIdentity.runtimeVersion ? 5252 : 6262,
+          version: input.identity.runtimeVersion,
+        };
+        publishDirectOwner(input.identity, live.pid);
+      },
+      repairServiceRuntime: async () => { repairs += 1; },
+    }), { runtimeManifestId: nextIdentity.runtimeManifestId });
+    expect(result.code).toBe(EXIT_OPERATION_FAILURE);
+    expect((result.json.error as { code: string }).code).toBe("proxy_not_ready");
+    expect(starts).toEqual([nextIdentity.runtimeVersion, oldIdentity.runtimeVersion]);
+    expect(repairs).toBe(0);
+    const pointer = readCurrentPointer(stableRoot);
+    expect(pointer.ok && pointer.pointer?.current.id).toBe(oldIdentity.runtimeManifestId);
+  });
+
+  test("service-repair remains forbidden for a desktop-direct owner", async () => {
+    const { oldIdentity } = prepareDirectActivationStore();
+    publishDirectOwner(oldIdentity, LIVE.pid);
+    let sideEffects = 0;
+    const result = await invoke("service-repair", baseDeps({
+      identity: oldIdentity,
+      cwd: oldIdentity.stableRuntimeRoot,
+      findLiveProxy: async () => ({ ...LIVE, version: oldIdentity.runtimeVersion }),
+      isAlive: pid => pid === LIVE.pid,
+      runStopTransaction: async () => {
+        sideEffects += 1;
+        throw new Error("must not stop");
+      },
+      startDirect: async () => { sideEffects += 1; },
+      repairServiceRuntime: async () => { sideEffects += 1; },
+    }), { runtimeManifestId: oldIdentity.runtimeManifestId });
+    expect(result.code).toBe(EXIT_OPERATION_FAILURE);
+    expect((result.json.error as { code: string }).code).toBe("ownership_conflict");
+    expect(sideEffects).toBe(0);
   });
 
   test("desktop-service start uses the structured seam and does not spawn CLI argv", async () => {
@@ -550,7 +775,11 @@ describe("production bridge handler contract", () => {
     expect(allowedMutationsFor("unknown/conflict", startable, identity, LIVE.pid)).toEqual([]);
     expect(allowedMutationsFor("existing-external", absent, identity, LIVE.pid)).toEqual(["stop"]);
     expect(allowedMutationsFor("existing-external", absent, identity, null)).toEqual(["stop", "service-install"]);
-    expect(allowedMutationsFor("desktop-direct", absent, identity, LIVE.pid)).toEqual(["stop", "service-install"]);
+    expect(allowedMutationsFor("desktop-direct", absent, identity, LIVE.pid)).toEqual([
+      "stop",
+      "service-install",
+      "runtime-activate",
+    ]);
     expect(allowedMutationsFor("desktop-service", startable, identity, LIVE.pid)).toEqual([
       "stop",
       "service-start",

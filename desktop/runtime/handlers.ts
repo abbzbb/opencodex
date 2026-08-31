@@ -71,6 +71,7 @@ import type {
   Operation,
   Owner,
   ProxyStatus,
+  RuntimeActivatePayload,
   ServiceInstallBackend,
   ServiceInstallPayload,
   ServiceRepairPayload,
@@ -246,7 +247,7 @@ export function allowedMutationsFor(
   if (owner === "desktop-service") {
     return ["stop", "service-start", "service-repair", "service-uninstall"];
   }
-  if (owner === "desktop-direct") return ["stop", "service-install"];
+  if (owner === "desktop-direct") return ["stop", "service-install", "runtime-activate"];
   if (owner === "existing-external" && !service.installed && livePid === null) {
     return ["stop", "service-install"];
   }
@@ -904,6 +905,17 @@ async function handleServiceMutation(
 ): Promise<HandlerOutcome> {
   const current = await currentStatus(deps, signal);
   const mutationDeps = serviceMutationDeps(deps, current, signal);
+  if (request.operation === "runtime-activate") {
+    if (current.owner !== "desktop-direct") {
+      return errorOutcome("ownership_conflict", "runtime activation is not permitted for this owner", false);
+    }
+    const payload = request.payload as RuntimeActivatePayload;
+    return runDesktopServiceMutation(
+      "repair",
+      { runtimeManifestId: payload.runtimeManifestId },
+      { ...mutationDeps, mode: "direct" },
+    );
+  }
   if (request.operation === "service-install") {
     const payload = request.payload as ServiceInstallPayload;
     return runDesktopServiceMutation("install", {
@@ -939,6 +951,7 @@ export function createBridgeHandler(deps: BridgeHandlerDeps = {}) {
       case "service-install":
       case "service-start":
       case "service-repair":
+      case "runtime-activate":
       case "service-uninstall":
         return handleServiceMutation(resolved, request, signal);
       case "legacy-tray-uninstall":

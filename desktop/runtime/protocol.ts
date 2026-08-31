@@ -12,6 +12,7 @@ export const OPERATIONS = [
   "bootstrap",
   "status",
   "stop",
+  "runtime-activate",
   "service-install",
   "service-start",
   "service-repair",
@@ -84,17 +85,23 @@ export type ServiceRepairPayload = {
   runtimeManifestId: string;
 };
 
+export type RuntimeActivatePayload = {
+  runtimeManifestId: string;
+};
+
 export type BridgePayload =
   | EmptyPayload
   | StopPayload
   | ServiceInstallPayload
-  | ServiceRepairPayload;
+  | ServiceRepairPayload
+  | RuntimeActivatePayload;
 
 export type BridgeRequest =
   | { schemaVersion: 1; requestId: string; operation: EmptyPayloadOperation; payload: EmptyPayload }
   | { schemaVersion: 1; requestId: string; operation: "stop"; payload: StopPayload }
   | { schemaVersion: 1; requestId: string; operation: "service-install"; payload: ServiceInstallPayload }
-  | { schemaVersion: 1; requestId: string; operation: "service-repair"; payload: ServiceRepairPayload };
+  | { schemaVersion: 1; requestId: string; operation: "service-repair"; payload: ServiceRepairPayload }
+  | { schemaVersion: 1; requestId: string; operation: "runtime-activate"; payload: RuntimeActivatePayload };
 
 export type ServiceState = {
   installed: boolean;
@@ -159,6 +166,7 @@ export type OperationResult = {
   "service-install": ServiceMutationResult;
   "service-start": ServiceMutationResult;
   "service-repair": ServiceMutationResult;
+  "runtime-activate": ServiceMutationResult;
   "service-uninstall": ServiceMutationResult;
   "legacy-tray-uninstall": LegacyTrayUninstallResult;
 };
@@ -261,6 +269,7 @@ const RECONCILIATION_KEYS = ["outcome", "followUpOperation", "blindRetry"] as co
 const STOP_PAYLOAD_KEYS = ["reason"] as const;
 const SERVICE_INSTALL_KEYS = ["backend", "runtimeManifestId"] as const;
 const SERVICE_REPAIR_KEYS = ["runtimeManifestId"] as const;
+const RUNTIME_ACTIVATE_KEYS = ["runtimeManifestId"] as const;
 
 function fail(message: string): ValidationErr {
   return { ok: false, message };
@@ -504,6 +513,21 @@ function validateServiceRepairPayload(value: unknown): Validation<ServiceRepairP
   return ok({ runtimeManifestId: obj.value.runtimeManifestId });
 }
 
+function validateRuntimeActivatePayload(value: unknown): Validation<RuntimeActivatePayload> {
+  const obj = asObject(value, "payload");
+  if (!obj.ok) {
+    return obj;
+  }
+  const keys = exactKeys(obj.value, RUNTIME_ACTIVATE_KEYS);
+  if (!keys.ok) {
+    return keys;
+  }
+  if (!isRuntimeManifestId(obj.value.runtimeManifestId)) {
+    return fail("invalid payload");
+  }
+  return ok({ runtimeManifestId: obj.value.runtimeManifestId });
+}
+
 export function validatePayload(operation: Operation, payload: unknown): Validation<BridgePayload> {
   if (isEmptyPayloadOperation(operation)) {
     return validateEmptyPayload(payload);
@@ -513,6 +537,9 @@ export function validatePayload(operation: Operation, payload: unknown): Validat
   }
   if (operation === "service-install") {
     return validateServiceInstallPayload(payload);
+  }
+  if (operation === "runtime-activate") {
+    return validateRuntimeActivatePayload(payload);
   }
   return validateServiceRepairPayload(payload);
 }
@@ -927,6 +954,7 @@ export function validateResult(operation: Operation, value: unknown): Validation
     case "service-install":
     case "service-start":
     case "service-repair":
+    case "runtime-activate":
     case "service-uninstall":
       return validateServiceMutationResult(value);
     case "legacy-tray-uninstall":

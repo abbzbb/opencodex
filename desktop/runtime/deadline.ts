@@ -3,6 +3,7 @@ import type { BridgeError, MutationTimeoutReconciliation, Operation } from "./pr
 export const STATUS_DEADLINE_MS = 10_000;
 export const BOOTSTRAP_STOP_DEADLINE_MS = 90_000;
 export const MUTATION_DEADLINE_MS = 120_000;
+export const RUNTIME_ACTIVATION_CLEANUP_GRACE_MS = 10_000;
 
 export const DEADLINE_MS = {
   status: STATUS_DEADLINE_MS,
@@ -11,6 +12,7 @@ export const DEADLINE_MS = {
   "service-install": MUTATION_DEADLINE_MS,
   "service-start": MUTATION_DEADLINE_MS,
   "service-repair": MUTATION_DEADLINE_MS,
+  "runtime-activate": MUTATION_DEADLINE_MS,
   "service-uninstall": MUTATION_DEADLINE_MS,
   "legacy-tray-uninstall": MUTATION_DEADLINE_MS,
 } as const satisfies Record<Operation, number>;
@@ -23,6 +25,10 @@ export const MUTATION_TIMEOUT_RECONCILIATION: MutationTimeoutReconciliation = {
 
 export function deadlineMsFor(operation: Operation): number {
   return DEADLINE_MS[operation];
+}
+
+export function cleanupGraceMsFor(operation: Operation): number {
+  return operation === "runtime-activate" ? RUNTIME_ACTIVATION_CLEANUP_GRACE_MS : 0;
 }
 
 export function requiresTimeoutReconciliation(operation: Operation): boolean {
@@ -77,30 +83,44 @@ export function deadlineExceededError(operation: Operation): BridgeError {
 export async function withDeadline<T>(
   deadlineMs: number,
   work: (signal: AbortSignal) => Promise<T>,
+  cleanupGraceMs = 0,
 ): Promise<T> {
-  if (!Number.isInteger(deadlineMs) || deadlineMs < 1) {
+  if (
+    !Number.isInteger(deadlineMs)
+    || deadlineMs < 1
+    || !Number.isInteger(cleanupGraceMs)
+    || cleanupGraceMs < 0
+  ) {
     throw new DeadlineExceededError("invalid deadline");
   }
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_, reject) => {
+  const timeout = new Promise<{ kind: "timeout" }>((resolve) => {
     timer = setTimeout(() => {
-      reject(new DeadlineExceededError());
       controller.abort();
+      resolve({ kind: "timeout" });
     }, deadlineMs);
   });
+  const workOutcome = Promise.resolve()
+    .then(() => work(controller.signal))
+    .then(
+      value => ({ kind: "value" as const, value }),
+      error => ({ kind: "error" as const, error }),
+    );
   try {
-    return await Promise.race([
-      Promise.resolve()
-        .then(() => work(controller.signal))
-        .catch((error: unknown) => {
-          if (controller.signal.aborted) {
-            throw new DeadlineExceededError();
-          }
-          throw error;
-        }),
-      timeout,
-    ]);
+    const outcome = await Promise.race([workOutcome, timeout]);
+    if (outcome.kind === "value") return outcome.value;
+    if (outcome.kind === "error") {
+      if (controller.signal.aborted) throw new DeadlineExceededError();
+      throw outcome.error;
+    }
+    if (cleanupGraceMs > 0) {
+      await Promise.race([
+        workOutcome.then(() => undefined),
+        new Promise<void>(resolve => setTimeout(resolve, cleanupGraceMs)),
+      ]);
+    }
+    throw new DeadlineExceededError();
   } finally {
     if (timer !== undefined) {
       clearTimeout(timer);

@@ -6,7 +6,9 @@ import {
   DeadlineExceededError,
   MUTATION_DEADLINE_MS,
   MUTATION_TIMEOUT_RECONCILIATION,
+  RUNTIME_ACTIVATION_CLEANUP_GRACE_MS,
   STATUS_DEADLINE_MS,
+  cleanupGraceMsFor,
   deadlineExceededError,
   deadlineMsFor,
   reconciliationForTimeout,
@@ -22,15 +24,19 @@ describe("exact budgets", () => {
     expect(STATUS_DEADLINE_MS).toBe(10_000);
     expect(BOOTSTRAP_STOP_DEADLINE_MS).toBe(90_000);
     expect(MUTATION_DEADLINE_MS).toBe(120_000);
+    expect(RUNTIME_ACTIVATION_CLEANUP_GRACE_MS).toBe(10_000);
     expect(deadlineMsFor("status")).toBe(10_000);
     expect(deadlineMsFor("bootstrap")).toBe(90_000);
     expect(deadlineMsFor("stop")).toBe(90_000);
     expect(deadlineMsFor("service-install")).toBe(120_000);
     expect(deadlineMsFor("service-start")).toBe(120_000);
     expect(deadlineMsFor("service-repair")).toBe(120_000);
+    expect(deadlineMsFor("runtime-activate")).toBe(120_000);
     expect(deadlineMsFor("service-uninstall")).toBe(120_000);
     expect(deadlineMsFor("legacy-tray-uninstall")).toBe(120_000);
     expect(DEADLINE_MS.status).toBe(10_000);
+    expect(cleanupGraceMsFor("runtime-activate")).toBe(10_000);
+    expect(cleanupGraceMsFor("service-repair")).toBe(0);
   });
 
   test("every closed operation has a budget", () => {
@@ -60,6 +66,7 @@ describe("mutation timeout reconciliation", () => {
       "service-install",
       "service-start",
       "service-repair",
+      "runtime-activate",
       "service-uninstall",
       "legacy-tray-uninstall",
     ];
@@ -108,6 +115,23 @@ describe("withDeadline", () => {
       }),
     ).rejects.toBeInstanceOf(DeadlineExceededError);
     expect(aborted).toBe(true);
+  });
+
+  test("waits a bounded cleanup grace after abort before reporting timeout", async () => {
+    let cleanupFinished = false;
+    const started = performance.now();
+    await expect(
+      withDeadline(10, async (signal) => {
+        await new Promise<void>(resolve => {
+          signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        await new Promise(resolve => setTimeout(resolve, 15));
+        cleanupFinished = true;
+        return 1;
+      }, 50),
+    ).rejects.toBeInstanceOf(DeadlineExceededError);
+    expect(cleanupFinished).toBe(true);
+    expect(performance.now() - started).toBeGreaterThanOrEqual(20);
   });
 });
 

@@ -8,11 +8,13 @@ pub const MAX_ERROR_MESSAGE_LENGTH: usize = 4096;
 pub const EXIT_SUCCESS: i32 = 0;
 pub const EXIT_OPERATION_FAILURE: i32 = 1;
 pub const EXIT_PROTOCOL_FAILURE: i32 = 2;
+pub const RUNTIME_ACTIVATE_WATCHDOG_MS: u64 = 135_000;
 
-pub const OPERATIONS: [&str; 8] = [
+pub const OPERATIONS: [&str; 9] = [
     "bootstrap",
     "status",
     "stop",
+    "runtime-activate",
     "service-install",
     "service-start",
     "service-repair",
@@ -339,7 +341,7 @@ pub fn validate_payload(operation: &str, payload: &Value) -> Result<Value, Valid
         validate_stop_payload(payload)
     } else if operation == "service-install" {
         validate_service_install_payload(payload)
-    } else if operation == "service-repair" {
+    } else if operation == "service-repair" || operation == "runtime-activate" {
         validate_service_repair_payload(payload)
     } else {
         fail("unknown operation")
@@ -622,9 +624,8 @@ pub fn validate_result(operation: &str, value: &Value) -> Result<Value, Validati
         "bootstrap" => validate_bootstrap_result(value),
         "status" => validate_status_result(value),
         "stop" => validate_stop_success_result(value),
-        "service-install" | "service-start" | "service-repair" | "service-uninstall" => {
-            validate_service_mutation_result(value)
-        }
+        "runtime-activate" | "service-install" | "service-start" | "service-repair"
+        | "service-uninstall" => validate_service_mutation_result(value),
         "legacy-tray-uninstall" => validate_legacy_tray_uninstall_result(value),
         _ => fail("unknown operation"),
     }
@@ -770,6 +771,7 @@ pub enum Operation {
     Bootstrap,
     Status,
     Stop,
+    RuntimeActivate,
     ServiceInstall,
     ServiceStart,
     ServiceRepair,
@@ -783,6 +785,7 @@ impl Operation {
             Self::Bootstrap => "bootstrap",
             Self::Status => "status",
             Self::Stop => "stop",
+            Self::RuntimeActivate => "runtime-activate",
             Self::ServiceInstall => "service-install",
             Self::ServiceStart => "service-start",
             Self::ServiceRepair => "service-repair",
@@ -795,6 +798,7 @@ impl Operation {
         match self {
             Self::Status => 10_000,
             Self::Bootstrap | Self::Stop => 90_000,
+            Self::RuntimeActivate => RUNTIME_ACTIVATE_WATCHDOG_MS,
             Self::ServiceInstall
             | Self::ServiceStart
             | Self::ServiceRepair
@@ -832,12 +836,18 @@ pub enum IssuedRequest {
         request_id: String,
         reason: StopReason,
     },
+    RuntimeActivate {
+        request_id: String,
+        runtime_manifest_id: String,
+    },
 }
 
 impl IssuedRequest {
     pub fn request_id(&self) -> &str {
         match self {
-            Self::Empty { request_id, .. } | Self::Stop { request_id, .. } => request_id,
+            Self::Empty { request_id, .. }
+            | Self::Stop { request_id, .. }
+            | Self::RuntimeActivate { request_id, .. } => request_id,
         }
     }
 
@@ -845,6 +855,7 @@ impl IssuedRequest {
         match self {
             Self::Empty { operation, .. } => *operation,
             Self::Stop { .. } => Operation::Stop,
+            Self::RuntimeActivate { .. } => Operation::RuntimeActivate,
         }
     }
 
@@ -864,6 +875,15 @@ impl IssuedRequest {
                 "requestId": request_id,
                 "operation": "stop",
                 "payload": { "reason": reason.as_str() },
+            }),
+            Self::RuntimeActivate {
+                request_id,
+                runtime_manifest_id,
+            } => serde_json::json!({
+                "schemaVersion": 1,
+                "requestId": request_id,
+                "operation": "runtime-activate",
+                "payload": { "runtimeManifestId": runtime_manifest_id },
             }),
         }
     }
@@ -903,6 +923,16 @@ pub fn stop_request(reason: StopReason) -> IssuedRequest {
     }
 }
 
+pub fn runtime_activate_request(runtime_manifest_id: &str) -> Result<IssuedRequest, ValidationErr> {
+    if !is_runtime_manifest_id(runtime_manifest_id) {
+        return fail("invalid runtimeManifestId");
+    }
+    Ok(IssuedRequest::RuntimeActivate {
+        request_id: new_request_id(),
+        runtime_manifest_id: runtime_manifest_id.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,6 +947,7 @@ mod tests {
                 "bootstrap",
                 "status",
                 "stop",
+                "runtime-activate",
                 "service-install",
                 "service-start",
                 "service-repair",
@@ -927,6 +958,8 @@ mod tests {
         assert_eq!(EXIT_SUCCESS, 0);
         assert_eq!(EXIT_OPERATION_FAILURE, 1);
         assert_eq!(EXIT_PROTOCOL_FAILURE, 2);
+        assert_eq!(Operation::RuntimeActivate.deadline_ms(), 135_000);
+        assert_eq!(RUNTIME_ACTIVATE_WATCHDOG_MS, 135_000);
     }
 
     #[test]
@@ -983,6 +1016,16 @@ mod tests {
         assert_eq!(json["payload"], serde_json::json!({}));
         assert!(obj.contains_key("requestId"));
         assert!(!req.encode().contains("argv"));
+
+        let activate = runtime_activate_request("ocx-runtime-2.36.0-linux").unwrap();
+        let json = activate.to_json();
+        assert_eq!(json["operation"], "runtime-activate");
+        assert_eq!(
+            json["payload"],
+            serde_json::json!({ "runtimeManifestId": "ocx-runtime-2.36.0-linux" })
+        );
+        assert!(parse_bridge_request(&json).is_ok());
+        assert!(runtime_activate_request("../runtime").is_err());
     }
 
     #[test]

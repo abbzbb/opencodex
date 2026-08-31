@@ -71,6 +71,7 @@ describe("closed enumerations", () => {
       "bootstrap",
       "status",
       "stop",
+      "runtime-activate",
       "service-install",
       "service-start",
       "service-repair",
@@ -188,6 +189,11 @@ describe("request payloads", () => {
     expect(parsed.ok).toBe(true);
   });
 
+  test("accepts runtime-activate manifest id", () => {
+    const parsed = parseBridgeRequest(request("runtime-activate", { runtimeManifestId: "manifest-1" }));
+    expect(parsed.ok).toBe(true);
+  });
+
   test("rejects unknown fields on every request and payload", () => {
     expectProtocolFail(request("status", {}, { extra: 1 }), "unknown field: extra");
     expectProtocolFail(request("status", { extra: 1 }), "unknown field: extra");
@@ -202,6 +208,10 @@ describe("request payloads", () => {
     );
     expectProtocolFail(
       request("service-repair", { runtimeManifestId: "manifest-1", extra: 1 }),
+      "unknown field: extra",
+    );
+    expectProtocolFail(
+      request("runtime-activate", { runtimeManifestId: "manifest-1", extra: 1 }),
       "unknown field: extra",
     );
   });
@@ -253,6 +263,9 @@ describe("request payloads", () => {
       "invalid payload",
     );
     expectProtocolFail(request("service-repair", { runtimeManifestId: "../x" }), "invalid payload");
+    expectProtocolFail(request("runtime-activate", { runtimeManifestId: "../x" }), "invalid payload");
+    expectProtocolFail(request("runtime-activate", { runtimeManifestId: "/abs/path" }), "invalid payload");
+    expectProtocolFail(request("runtime-activate", {}), "missing field: runtimeManifestId");
     expect(validatePayload("bootstrap", {}).ok).toBe(true);
     expect(validatePayload("bootstrap", { x: 1 }).ok).toBe(false);
   });

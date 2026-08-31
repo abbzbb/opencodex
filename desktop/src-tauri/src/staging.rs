@@ -369,21 +369,23 @@ pub fn staging_spec_from_layout(
     )))
 }
 
-pub fn install_packaged_runtime(layout: &BridgeLayout) -> Result<(), StagingClientError> {
+pub fn install_packaged_runtime(
+    layout: &BridgeLayout,
+) -> Result<Option<StagingSuccess>, StagingClientError> {
     let Some(spec) = staging_spec_from_layout(layout)? else {
-        return Ok(());
+        return Ok(None);
     };
     let success = invoke_staging(&spec)?;
     let current = read_current_pointer(&spec.stable_root)?;
     if current
         != (CurrentPointer {
-            current: success.current,
-            previous: success.previous,
+            current: success.current.clone(),
+            previous: success.previous.clone(),
         })
     {
         return Err(StagingClientError::Protocol);
     }
-    Ok(())
+    Ok(Some(success))
 }
 
 #[cfg(test)]

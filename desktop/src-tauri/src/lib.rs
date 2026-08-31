@@ -8,17 +8,24 @@ mod protocol;
 mod staging;
 mod tray;
 
+use std::fs::symlink_metadata;
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
 
-use crate::bridge::{bridge_spec_from_layout, default_bridge_spec, invoke_bridge, BridgeSpec};
+use crate::bridge::{
+    bridge_spec_from_layout, default_bridge_spec, invoke_bridge, BridgeClientError, BridgeSpec,
+};
 use crate::lifecycle::{quit_decision_from_stop, QuitDecision, QuitPhase};
 use crate::navigation::{init_plugin as navigation_plugin, set_allowed_origin, NavigationPolicy};
-use crate::packaging::layout_from_app;
-use crate::protocol::{bootstrap_request, status_request, stop_request, StopReason};
-use crate::staging::install_packaged_runtime;
+use crate::packaging::{
+    layout_from_app, read_current_pointer, BridgeLayout, CurrentPointer, CURRENT_POINTER_NAME,
+};
+use crate::protocol::{
+    bootstrap_request, runtime_activate_request, status_request, stop_request, StopReason,
+};
+use crate::staging::{install_packaged_runtime, StagingSuccess};
 use crate::tray::{install_tray, show_main_window, TRAY_OPEN, TRAY_QUIT, TRAY_STATUS};
 
 pub struct AppState {
@@ -99,6 +106,104 @@ fn attach_dashboard(app: &AppHandle, origin: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn has_published_runtime(layout: &BridgeLayout) -> bool {
+    match symlink_metadata(layout.stable_root.join(CURRENT_POINTER_NAME)) {
+        Ok(_) => true,
+        Err(err) => err.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+fn bootstrap_with_reconciliation(spec: &BridgeSpec) -> Result<Value, BridgeClientError> {
+    let initial = invoke_bridge(spec, &bootstrap_request())?;
+    if initial["ok"] == Value::Bool(true) || initial["error"]["retryable"] != Value::Bool(true) {
+        return Ok(initial);
+    }
+    let status = match invoke_bridge(spec, &status_request()) {
+        Ok(status) => status,
+        Err(_) => return Ok(initial),
+    };
+    if status["ok"] != Value::Bool(true) || status["result"]["status"] == "pending" {
+        return Ok(initial);
+    }
+    invoke_bridge(spec, &bootstrap_request())
+}
+
+fn staged_activation_required(staged: &StagingSuccess) -> bool {
+    !staged.published && staged.current != staged.staged
+}
+
+fn activation_pointer_matches(staged: &StagingSuccess, observed: &CurrentPointer) -> bool {
+    observed.current == staged.staged && observed.previous.as_ref() == Some(&staged.current)
+}
+
+fn previous_pointer_matches(staged: &StagingSuccess, observed: &CurrentPointer) -> bool {
+    observed.current == staged.current && observed.previous == staged.previous
+}
+
+fn activation_result_ready(envelope: &Value) -> bool {
+    envelope["ok"] == Value::Bool(true)
+        && envelope["result"]["changed"] == Value::Bool(true)
+        && envelope["result"]["proxyStatus"] == "ready"
+}
+
+fn status_confirms_direct_ready(envelope: &Value, expected_version: &str) -> bool {
+    envelope["ok"] == Value::Bool(true)
+        && envelope["result"]["status"] == "ready"
+        && envelope["result"]["owner"] == "desktop-direct"
+        && envelope["result"]["version"] == expected_version
+}
+
+fn bootstrap_allows_runtime_activation(envelope: &Value) -> bool {
+    envelope["result"]["allowedMutations"]
+        .as_array()
+        .is_some_and(|mutations| mutations.iter().any(|value| value == "runtime-activate"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivationReconciliation {
+    CandidateReady,
+    PreviousReady,
+    Unknown,
+}
+
+fn reconcile_runtime_activation(
+    layout: &BridgeLayout,
+    staged: &StagingSuccess,
+) -> ActivationReconciliation {
+    let before = match read_current_pointer(&layout.stable_root) {
+        Ok(pointer) => pointer,
+        Err(_) => return ActivationReconciliation::Unknown,
+    };
+    let (state, expected_version) = if activation_pointer_matches(staged, &before) {
+        (
+            ActivationReconciliation::CandidateReady,
+            staged.staged.version.as_str(),
+        )
+    } else if previous_pointer_matches(staged, &before) {
+        (
+            ActivationReconciliation::PreviousReady,
+            staged.current.version.as_str(),
+        )
+    } else {
+        return ActivationReconciliation::Unknown;
+    };
+    let spec = match bridge_spec_from_layout(layout) {
+        Ok(spec) => spec,
+        Err(_) => return ActivationReconciliation::Unknown,
+    };
+    let status = match invoke_bridge(&spec, &status_request()) {
+        Ok(status) => status,
+        Err(_) => return ActivationReconciliation::Unknown,
+    };
+    if !status_confirms_direct_ready(&status, expected_version) {
+        return ActivationReconciliation::Unknown;
+    }
+    match read_current_pointer(&layout.stable_root) {
+        Ok(after) if after == before => state,
+        _ => ActivationReconciliation::Unknown,
+    }
+}
+
 fn bootstrap_and_attach(app: &AppHandle) {
     let layout = match layout_from_app(app) {
         Ok(layout) => layout,
@@ -112,15 +217,156 @@ fn bootstrap_and_attach(app: &AppHandle) {
             return;
         }
     };
-    if let Err(err) = install_packaged_runtime(&layout) {
-        set_shell_copy(
-            app,
-            "OpenCodex could not start",
-            "The packaged runtime could not be installed safely.",
-            &format!("{}: {}", err.code(), err.message()),
-        );
-        return;
+    let preflight = if has_published_runtime(&layout) {
+        let spec = match bridge_spec_from_layout(&layout) {
+            Ok(spec) => spec,
+            Err(err) => {
+                set_shell_copy(
+                    app,
+                    "OpenCodex could not start",
+                    "The published runtime could not be verified before installation.",
+                    &format!("{}: {}", err.code(), err.message()),
+                );
+                return;
+            }
+        };
+        match bootstrap_with_reconciliation(&spec) {
+            Ok(envelope) if envelope["ok"] == Value::Bool(true) => Some((spec, envelope)),
+            Ok(envelope) => {
+                set_shell_copy(
+                    app,
+                    "OpenCodex could not start",
+                    "The current runtime could not be reconciled before installation.",
+                    &error_message(Ok(&envelope)),
+                );
+                return;
+            }
+            Err(err) => {
+                set_shell_copy(
+                    app,
+                    "OpenCodex could not start",
+                    "The current runtime bootstrap request failed before installation.",
+                    &format!("{}: {}", err.code(), err.message()),
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    let staged = match install_packaged_runtime(&layout) {
+        Ok(staged) => staged,
+        Err(err) => {
+            set_shell_copy(
+                app,
+                "OpenCodex could not start",
+                "The packaged runtime could not be installed safely.",
+                &format!("{}: {}", err.code(), err.message()),
+            );
+            return;
+        }
+    };
+
+    if let Some(staged) = staged
+        .as_ref()
+        .filter(|value| staged_activation_required(value))
+    {
+        let Some((spec, bootstrap)) = preflight.as_ref() else {
+            set_shell_copy(
+                app,
+                "OpenCodex could not start",
+                "The staged runtime cannot replace an unverified current runtime.",
+                "runtime_integrity_failed: activation preflight is unavailable",
+            );
+            return;
+        };
+        match bootstrap["result"]["owner"].as_str() {
+            Some("desktop-direct") => {
+                if !bootstrap_allows_runtime_activation(bootstrap) {
+                    set_shell_copy(
+                        app,
+                        "OpenCodex could not start",
+                        "The current runtime does not advertise safe runtime activation.",
+                        "unsupported_operation: runtime-activate capability is unavailable",
+                    );
+                    return;
+                }
+                let request = match runtime_activate_request(&staged.staged.id) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        set_shell_copy(
+                            app,
+                            "OpenCodex could not start",
+                            "The staged runtime identity is invalid.",
+                            "runtime_integrity_failed: activation request is invalid",
+                        );
+                        return;
+                    }
+                };
+                let failure_detail = match invoke_bridge(spec, &request) {
+                    Ok(envelope) if activation_result_ready(&envelope) => None,
+                    Ok(envelope) => Some(error_message(Ok(&envelope))),
+                    Err(err) => Some(format!("{}: {}", err.code(), err.message())),
+                };
+                if let Some(detail) = failure_detail {
+                    match reconcile_runtime_activation(&layout, staged) {
+                        ActivationReconciliation::CandidateReady => {}
+                        ActivationReconciliation::PreviousReady => {
+                            set_shell_copy(
+                                app,
+                                "OpenCodex could not start",
+                                "The new runtime was not activated; the previous runtime is verified ready.",
+                                &detail,
+                            );
+                            return;
+                        }
+                        ActivationReconciliation::Unknown => {
+                            set_shell_copy(
+                                app,
+                                "OpenCodex could not start",
+                                "The runtime activation outcome is unresolved; recovery is required before retrying.",
+                                &detail,
+                            );
+                            return;
+                        }
+                    }
+                }
+                let observed = match read_current_pointer(&layout.stable_root) {
+                    Ok(pointer) => pointer,
+                    Err(err) => {
+                        set_shell_copy(
+                            app,
+                            "OpenCodex could not start",
+                            "The activated runtime pointer could not be verified.",
+                            &format!("{}: {}", err.code(), err.message()),
+                        );
+                        return;
+                    }
+                };
+                if !activation_pointer_matches(staged, &observed) {
+                    set_shell_copy(
+                        app,
+                        "OpenCodex could not start",
+                        "The activated runtime pointer does not match the staged runtime.",
+                        "runtime_integrity_failed: activation pointer mismatch",
+                    );
+                    return;
+                }
+            }
+            Some("existing-external" | "desktop-service") => {}
+            _ => {
+                set_shell_copy(
+                    app,
+                    "OpenCodex could not start",
+                    "The staged runtime cannot replace a conflicting runtime owner.",
+                    "ownership_conflict: runtime activation is not permitted",
+                );
+                return;
+            }
+        }
     }
+
     let spec = match bridge_spec_from_layout(&layout) {
         Ok(spec) => spec,
         Err(err) => {
@@ -133,7 +379,7 @@ fn bootstrap_and_attach(app: &AppHandle) {
             return;
         }
     };
-    match invoke_bridge(&spec, &bootstrap_request()) {
+    match bootstrap_with_reconciliation(&spec) {
         Ok(envelope) if envelope["ok"] == Value::Bool(true) => {
             if let Some(origin) = envelope["result"]["origin"].as_str() {
                 if let Some(state) = app.try_state::<AppState>() {
@@ -424,14 +670,114 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_stages_before_resolving_the_stable_bridge() {
+    fn bootstrap_recovers_before_staging_and_reloads_the_stable_bridge() {
         let source = include_str!("lib.rs");
         let start = source.find("fn bootstrap_and_attach").unwrap();
         let body = &source[start..source.find("fn refresh_status").unwrap()];
+        let preflight = body.find("bootstrap_with_reconciliation(&spec)").unwrap();
         let stage = body.find("install_packaged_runtime(&layout)").unwrap();
-        let bridge = body.find("bridge_spec_from_layout(&layout)").unwrap();
-        let invoke = body.find("invoke_bridge(&spec").unwrap();
-        assert!(stage < bridge && bridge < invoke);
+        let activate = body
+            .find("runtime_activate_request(&staged.staged.id)")
+            .unwrap();
+        let final_bridge = body.rfind("bridge_spec_from_layout(&layout)").unwrap();
+        assert!(preflight < stage && stage < activate && activate < final_bridge);
+    }
+
+    fn version_pointer(version: &str) -> crate::packaging::VersionPointer {
+        crate::packaging::VersionPointer {
+            id: format!("ocx-runtime-{version}"),
+            version: version.to_string(),
+            target: "x86_64-unknown-linux-gnu".to_string(),
+            rel_path: format!("versions/{version}"),
+        }
+    }
+
+    #[test]
+    fn staged_activation_requires_a_distinct_unpublished_candidate() {
+        let old = version_pointer("2.35.0");
+        let next = version_pointer("2.36.0");
+        let staged = StagingSuccess {
+            current: old.clone(),
+            previous: None,
+            staged: next.clone(),
+            reused: false,
+            published: false,
+        };
+        assert!(staged_activation_required(&staged));
+        assert!(activation_pointer_matches(
+            &staged,
+            &CurrentPointer {
+                current: next,
+                previous: Some(old),
+            }
+        ));
+        assert!(previous_pointer_matches(
+            &staged,
+            &CurrentPointer {
+                current: staged.current.clone(),
+                previous: staged.previous.clone(),
+            }
+        ));
+
+        let reused = StagingSuccess {
+            current: version_pointer("2.36.0"),
+            previous: None,
+            staged: version_pointer("2.36.0"),
+            reused: true,
+            published: false,
+        };
+        assert!(!staged_activation_required(&reused));
+    }
+
+    #[test]
+    fn activation_result_must_report_a_ready_changed_runtime() {
+        let ready = serde_json::json!({
+            "ok": true,
+            "result": { "changed": true, "proxyStatus": "ready" }
+        });
+        assert!(activation_result_ready(&ready));
+        assert!(!activation_result_ready(&serde_json::json!({
+            "ok": true,
+            "result": { "changed": false, "proxyStatus": "ready" }
+        })));
+        assert!(!activation_result_ready(&serde_json::json!({
+            "ok": false,
+            "error": { "code": "restore_failed" }
+        })));
+
+        let status = serde_json::json!({
+            "ok": true,
+            "result": { "status": "ready", "owner": "desktop-direct", "version": "2.36.0" }
+        });
+        assert!(status_confirms_direct_ready(&status, "2.36.0"));
+        assert!(!status_confirms_direct_ready(
+            &serde_json::json!({
+                "ok": true,
+                "result": { "status": "pending", "owner": "desktop-direct", "version": "2.36.0" }
+            }),
+            "2.36.0"
+        ));
+        assert!(!status_confirms_direct_ready(
+            &serde_json::json!({
+                "ok": true,
+                "result": { "status": "ready", "owner": "existing-external", "version": "2.36.0" }
+            }),
+            "2.36.0"
+        ));
+        assert!(!status_confirms_direct_ready(
+            &serde_json::json!({
+                "ok": true,
+                "result": { "status": "ready", "owner": "desktop-direct", "version": "2.35.0" }
+            }),
+            "2.36.0"
+        ));
+
+        assert!(bootstrap_allows_runtime_activation(&serde_json::json!({
+            "result": { "allowedMutations": ["stop", "runtime-activate"] }
+        })));
+        assert!(!bootstrap_allows_runtime_activation(&serde_json::json!({
+            "result": { "allowedMutations": ["stop"] }
+        })));
     }
 
     #[test]
