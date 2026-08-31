@@ -1,0 +1,88 @@
+name: Desktop Linux systemd probe
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "package.json"
+      - "bun.lock"
+      - "gui/**"
+      - "desktop/**"
+      - ".github/workflows/desktop-linux-systemd-probe.yml"
+      - ".github/actions/setup-project-bun/action.yml"
+  push:
+    branches: [main, preview, dev]
+    paths:
+      - "src/**"
+      - "package.json"
+      - "bun.lock"
+      - "gui/**"
+      - "desktop/**"
+      - ".github/workflows/desktop-linux-systemd-probe.yml"
+      - ".github/actions/setup-project-bun/action.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-linux-systemd-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-deb-systemd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-project-bun
+      - run: bun install --frozen-lockfile
+
+      - name: Build packaged runtime
+        run: |
+          bun desktop/scripts/build-runtime.ts \
+            --target x86_64-unknown-linux-gnu \
+            --output desktop/src-tauri/resources/runtime
+
+      - name: Probe desktop-direct two-generation
+        env:
+          OCX_PROBE_RUNTIME_ROOT: ${{ github.workspace }}/desktop/src-tauri/resources/runtime
+        run: bun desktop/scripts/probe-desktop-direct-two-generation.ts
+
+      - name: Pack runtime-layout deb
+        run: |
+          bun desktop/scripts/pack-linux-runtime-deb.ts \
+            --runtime-root desktop/src-tauri/resources/runtime \
+            --output "$RUNNER_TEMP/open-codex-runtime.deb"
+
+      # The synthetic runtime-layout .deb stays installed on this ephemeral runner
+      # until GitHub tears the VM down. This job does not run dpkg -r.
+
+      - name: Enable systemd user session
+        run: |
+          sudo loginctl enable-linger "$(whoami)"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+
+      - name: Install runtime-layout deb
+        run: sudo dpkg -i "$RUNNER_TEMP/open-codex-runtime.deb"
+
+      - name: Probe systemd from package-owned runtime
+        env:
+          PATH: /usr/bin:/bin
+          OCX_DESTRUCTIVE_SYSTEMD_PROBE: "1"
+        run: |
+          if command -v bun >/dev/null || command -v node >/dev/null || command -v npm >/dev/null || command -v ocx >/dev/null; then
+            echo "::error::global JS runtime remained on PATH"
+            exit 1
+          fi
+          /usr/bin/ocx-runtime "$GITHUB_WORKSPACE/desktop/scripts/probe-linux-deb-systemd.ts"
+
+      - name: Bounded failure diagnostics
+        if: ${{ failure() && !cancelled() }}
+        env:
+          PATH: /usr/bin:/bin
+        run: |
+          systemctl --user status opencodex-proxy --no-pager -n 30 || true
+          journalctl --user-unit opencodex-proxy --no-pager -n 80 || true

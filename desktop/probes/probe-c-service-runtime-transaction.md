@@ -134,11 +134,14 @@ platform service smoke and does not prove:
 
 - macOS launchd install/crash-restart/repair/rollback
 - Windows Task Scheduler or WinSW
-- Linux `.deb` systemd user service
-- packaged desktop-direct survivor re-attest after a real shell crash
-- real-child old-to-new desktop-direct update and failed-update restart from
-  the previous absolute paths (the production bridge path is wired; current
-  deterministic child/service effects are injected seams)
+- packaged desktop-direct survivor/update/rollback on real children (see
+  `probe-c-desktop-direct-two-generation.md`; source-overlay live-process
+  evidence with a cooperative ready-failed fixture, not two immutable Tauri
+  packaged releases; live ready-failed rollback is CI-pending in
+  `desktop-linux-systemd-probe.yml`)
+- Linux `.deb` systemd user service (runtime-layout `.deb`, CI workflow only
+  and CI-pending; see `probe-c-linux-deb-systemd.md`)
+- actual Tauri old/new packaged-release evidence
 - WebView, session/CSRF, navigation, tray, single-instance, signing, or
   autoupdate
 

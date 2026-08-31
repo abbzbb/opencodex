@@ -157,10 +157,18 @@ require owner/version/readiness plus a second pointer read. Cleanup after abort
 is best-effort; a pending durable journal is recovered by the next bootstrap
 rather than treated as a completed rollback. Service/process managers in this
 evidence are fakes/seams, not
-physical platform or packaged old/new child smoke. Probe C remains OPEN until
-macOS launchd, Windows scheduler/WinSW, Linux `.deb` systemd service smoke, and
-real-process survivor/update/rollback evidence are complete. The service-path /
-global-stop shared-lock race remains WATCH.
+physical platform or packaged old/new child smoke. A real-process two-generation
+desktop-direct probe is in
+[`probe-c-desktop-direct-two-generation.md`](./probes/probe-c-desktop-direct-two-generation.md).
+That probe is source-overlay live-process evidence (packaged payload plus current
+`desktop/runtime` and `src`), not two immutable packaged Desktop releases. Actual
+Tauri old/new package evidence remains OPEN. The live ready-failed rollback and
+the Linux `.deb` systemd user-service smoke are both CI-only in
+`.github/workflows/desktop-linux-systemd-probe.yml`
+([`probe-c-linux-deb-systemd.md`](./probes/probe-c-linux-deb-systemd.md)); the
+`.deb` is a runtime-layout package, unproven until that workflow is green, and
+is not macOS/Windows or Tauri GUI evidence. Probe C remains OPEN. The
+service-path / global-stop shared-lock race remains WATCH.
 
 Neither Linux `.deb` probe is WebView, session/CSRF, or navigation evidence.
 The post-install probe directly asserted no Codex CLI and checked the full

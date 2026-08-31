@@ -615,6 +615,53 @@ describe("GitHub Actions hardening", () => {
     expect(text).not.toMatch(/uses:\s+\S+@(?:v\d+|main|master)\b/);
   });
 
+  test("desktop linux systemd probe is least-privilege, SHA-pinned, and package-owned", async () => {
+    const workflow = await readText(".github/workflows/desktop-linux-systemd-probe.yml");
+    const parsed = Bun.YAML.parse(workflow) as {
+      on?: {
+        pull_request?: { paths?: string[]; branches?: string[] };
+        push?: { paths?: string[]; branches?: string[] };
+      };
+    };
+    const expectedPaths = [
+      "src/**",
+      "package.json",
+      "bun.lock",
+      "gui/**",
+      "desktop/**",
+      ".github/workflows/desktop-linux-systemd-probe.yml",
+      ".github/actions/setup-project-bun/action.yml",
+    ];
+    expect([...(parsed.on?.pull_request?.paths ?? [])]).toEqual(expectedPaths);
+    expect([...(parsed.on?.push?.paths ?? [])]).toEqual(expectedPaths);
+    expect([...(parsed.on?.push?.branches ?? [])].sort()).toEqual(["dev", "main", "preview"]);
+    expect(parsed.on?.push?.branches ?? []).not.toContain("app/desktop");
+    expect(workflow).toContain("permissions:\n  contents: read");
+    expect(workflow).toContain("group: desktop-linux-systemd-probe-${{ github.ref }}");
+    expect(workflow).toContain("cancel-in-progress: true");
+    expect(workflow).toContain("timeout-minutes: 45");
+    expect(workflow).toContain("actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0");
+    expect(workflow).toContain("persist-credentials: false");
+    expect(workflow).toContain("./.github/actions/setup-project-bun");
+    expect(workflow).toContain("PATH: /usr/bin:/bin");
+    expect(workflow).toContain("OCX_DESTRUCTIVE_SYSTEMD_PROBE: \"1\"");
+    expect(workflow).toContain("OCX_PROBE_RUNTIME_ROOT");
+    expect(workflow).toContain("desktop/scripts/probe-desktop-direct-two-generation.ts");
+    expect(workflow).toContain("/usr/bin/ocx-runtime");
+    expect(workflow).toContain("desktop/scripts/probe-linux-deb-systemd.ts");
+    expect(workflow).toContain("dpkg -i");
+    expect(workflow).toContain("This job does not run dpkg -r");
+    expect(workflow.indexOf("probe-desktop-direct-two-generation.ts"))
+      .toBeLessThan(workflow.indexOf("dpkg -i"));
+    expect(workflow).not.toContain("app/desktop");
+    expect(workflow).not.toContain("pull_request_target");
+    expect(workflow).not.toContain("secrets.");
+    expect(workflow).not.toContain("always()");
+    expect(workflow).not.toMatch(/uses:\s+\S+@(?:v\d+|main|master)\b/);
+    expect(workflow).not.toContain("macos-latest");
+    expect(workflow).not.toContain("windows-latest");
+  });
+
   test("service lifecycle is least-privilege, bounded, and cannot swallow health failures", async () => {
     const workflow = await readText(".github/workflows/service-lifecycle.yml");
 
