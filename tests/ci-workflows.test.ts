@@ -643,6 +643,9 @@ describe("GitHub Actions hardening", () => {
     expect(workflow).toContain("actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0");
     expect(workflow).toContain("persist-credentials: false");
     expect(workflow).toContain("./.github/actions/setup-project-bun");
+    expect(workflow).toContain("bun run build:gui");
+    expect(workflow.indexOf("bun run build:gui"))
+      .toBeLessThan(workflow.indexOf("desktop/scripts/build-runtime.ts"));
     expect(workflow).toContain("PATH: /usr/bin:/bin");
     expect(workflow).toContain("OCX_DESTRUCTIVE_SYSTEMD_PROBE: \"1\"");
     expect(workflow).toContain("OCX_PROBE_RUNTIME_ROOT");

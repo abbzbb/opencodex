@@ -40,6 +40,9 @@ jobs:
       - uses: ./.github/actions/setup-project-bun
       - run: bun install --frozen-lockfile
 
+      - name: Build GUI
+        run: bun run build:gui
+
       - name: Build packaged runtime
         run: |
           bun desktop/scripts/build-runtime.ts \

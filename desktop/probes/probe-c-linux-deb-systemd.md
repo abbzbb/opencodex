@@ -42,7 +42,8 @@ and systemd mutation.
 - no secrets, no `pull_request_target`, no untrusted artifacts
 - `actions/checkout` pinned to `9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0` with
   `persist-credentials: false`
-- build uses the first-party `./.github/actions/setup-project-bun`
+- build uses the first-party `./.github/actions/setup-project-bun`, then
+  `bun run build:gui`, then `build-runtime` (so `gui/dist` exists before pack)
 - path filter covers `src/**`, `package.json`, `bun.lock`, `gui/**`,
   `desktop/**`, the workflow, and the setup action
 - push trigger is `main`, `preview`, and `dev` only
