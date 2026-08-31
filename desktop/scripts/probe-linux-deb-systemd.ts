@@ -99,9 +99,11 @@ export type SystemdProbeSummary = {
 };
 
 function which(name: string): string | null {
+  const path = process.env.PATH;
+  if (typeof path !== "string" || path.trim().length === 0) return null;
   const result = spawnSync("sh", ["-c", `command -v ${name}`], {
     encoding: "utf8",
-    env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+    env: { PATH: path },
   });
   const value = result.stdout.trim();
   return result.status === 0 && value.length > 0 ? value : null;
@@ -329,6 +331,8 @@ export async function runLinuxDebSystemdProbe(): Promise<SystemdProbeSummary> {
   if (which("bun") || which("node") || which("npm") || which("ocx") || which("opencodex")) {
     fail("global JS runtime is on PATH");
   }
+  const restrictedPath = process.env.PATH?.trim() ?? "";
+  if (restrictedPath.length === 0) fail("restricted PATH is missing");
   const target = LINUX_X64_TARGET;
   const sourceManifest = readRuntimeManifestFile(join(INSTALLED_RUNTIME, "runtime-manifest.json"), {
     expectedTarget: target,
@@ -342,6 +346,7 @@ export async function runLinuxDebSystemdProbe(): Promise<SystemdProbeSummary> {
     HOME: homedir(),
     XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR ?? homes.env.XDG_RUNTIME_DIR,
   };
+  env.PATH = restrictedPath;
   const isolatedStatePath = join(env.OPENCODEX_HOME, "service-state.json");
   const baseline = snapshotSystemdSurfaceStrict(isolatedStatePath);
   requireAbsentSystemdProbeSurface(baseline);

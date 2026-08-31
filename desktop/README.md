@@ -167,9 +167,11 @@ the Linux `.deb` systemd user-service smoke are both CI-only in
 `.github/workflows/desktop-linux-systemd-probe.yml`
 ([`probe-c-linux-deb-systemd.md`](./probes/probe-c-linux-deb-systemd.md)); the
 `.deb` is a runtime-layout package, unproven until that workflow is green, and
-is not macOS/Windows or Tauri GUI evidence. That workflow also covers Linux
-zombie liveness (`/proc/<pid>/stat` `Z`/`X` after `kill(pid,0)`), which it
-uncovered as `restore_failed/owned-live-graceful-stop`. Probe C remains OPEN. The
+is not macOS/Windows or Tauri GUI evidence. The systemd step PATH is a private
+`RUNNER_TEMP` allowlist (not `/usr/bin:/bin`, which still has `node` on GitHub
+ubuntu). That workflow also covers Linux zombie liveness (`/proc/<pid>/stat`
+`Z`/`X` after `kill(pid,0)`), which it uncovered as
+`restore_failed/owned-live-graceful-stop`. Probe C remains OPEN. The
 service-path / global-stop shared-lock race remains WATCH.
 
 Neither Linux `.deb` probe is WebView, session/CSRF, or navigation evidence.

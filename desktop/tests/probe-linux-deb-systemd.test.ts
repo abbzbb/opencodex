@@ -376,6 +376,10 @@ describe("linux deb systemd probe contract", () => {
     expect(source).toContain("terminateOwnedProbeChildren");
     expect(source).toContain("requireProxyNotReadyAfterFailedStart");
     expect(source).toContain("requireStubCleanupOk");
+    expect(source).toContain("env.PATH = restrictedPath");
+    expect(source).toContain("process.env.PATH");
+    expect(source).toContain("restricted PATH is missing");
+    expect(source).not.toContain("/usr/bin:/bin");
     expect(source).not.toContain("restore_failed");
     expect(source).not.toMatch(/chmodSync\([^)]*0o644/);
     expect(source).not.toContain("0o644");

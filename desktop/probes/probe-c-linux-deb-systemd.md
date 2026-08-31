@@ -48,9 +48,17 @@ and systemd mutation.
   `desktop/**`, the workflow, and the setup action
 - push trigger is `main`, `preview`, and `dev` only
 - two-generation live probe runs after the runtime build, before `dpkg`
-- systemd smoke resets `PATH=/usr/bin:/bin`, sets
-  `OCX_DESTRUCTIVE_SYSTEMD_PROBE=1`, and invokes `/usr/bin/ocx-runtime` only
-- failure logs are bounded `systemctl`/`journalctl` tails
+- after `dpkg -i`, a prepare step writes a private directory under
+  `RUNNER_TEMP` with symlinks for a fixed allowlist (`sh`, `systemctl`,
+  `kill`, `ps`, `ss`, `lsof`, `cp`) resolved from `/usr/bin` then `/bin`; it fails
+  if any required tool is missing and does not include `node`, `bun`, `npm`,
+  `ocx`, or `opencodex`
+- systemd smoke sets `PATH` to only that private directory,
+  `OCX_DESTRUCTIVE_SYSTEMD_PROBE=1`, and invokes `/usr/bin/ocx-runtime`
+  absolutely; after the CI and no-global-runtime gates the probe copies
+  `process.env.PATH` onto `env.PATH` so install/bridge/direct children and the
+  systemd unit inherit the same restricted PATH; failure logs still use
+  `PATH=/usr/bin:/bin`
 
 ## After push, observe
 

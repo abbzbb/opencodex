@@ -656,6 +656,48 @@ describe("GitHub Actions hardening", () => {
     expect(workflow).toContain("This job does not run dpkg -r");
     expect(workflow.indexOf("probe-desktop-direct-two-generation.ts"))
       .toBeLessThan(workflow.indexOf("dpkg -i"));
+    const systemdJob = (Bun.YAML.parse(workflow) as {
+      jobs?: {
+        "linux-deb-systemd"?: {
+          steps?: { name?: string; env?: Record<string, string>; run?: string }[];
+        };
+      };
+    }).jobs?.["linux-deb-systemd"];
+    const steps = systemdJob?.steps ?? [];
+    const dpkgIdx = steps.findIndex(step => step.name === "Install runtime-layout deb");
+    const prepIdx = steps.findIndex(step => step.name === "Prepare systemd probe PATH");
+    const probeIdx = steps.findIndex(step => step.name === "Probe systemd from package-owned runtime");
+    const diagIdx = steps.findIndex(step => step.name === "Bounded failure diagnostics");
+    expect(dpkgIdx).toBeGreaterThan(-1);
+    expect(prepIdx).toBeGreaterThan(dpkgIdx);
+    expect(probeIdx).toBeGreaterThan(prepIdx);
+    expect(diagIdx).toBeGreaterThan(probeIdx);
+    const prep = steps[prepIdx]!.run ?? "";
+    const requiredStart = prep.indexOf("required=(");
+    const requiredEnd = prep.indexOf(")", requiredStart);
+    const required = prep.slice(requiredStart, requiredEnd + 1);
+    expect(required).toContain("sh");
+    expect(required).toContain("systemctl");
+    expect(required).toContain("kill");
+    expect(required).toContain("ps");
+    expect(required).toContain("ss");
+    expect(required).toContain("lsof");
+    expect(required).toContain("cp");
+    expect(required).not.toContain("node");
+    expect(required).not.toContain("bun");
+    expect(required).not.toContain("npm");
+    expect(required).not.toContain("ocx");
+    expect(required).not.toContain("opencodex");
+    expect(prep).toContain('for dir in /usr/bin /bin; do');
+    expect(prep).toContain("readlink -f");
+    expect(prep).toContain("ln -s");
+    expect(prep).toContain("required tool missing");
+    expect(prep).not.toContain("github.event");
+    expect(prep).not.toContain("${{");
+    expect(steps[probeIdx]!.env?.PATH).toBe("${{ runner.temp }}/ocx-systemd-path");
+    expect(steps[probeIdx]!.env?.PATH).not.toContain("/usr/bin");
+    expect(steps[probeIdx]!.run).toContain("/usr/bin/ocx-runtime");
+    expect(steps[diagIdx]!.env?.PATH).toBe("/usr/bin:/bin");
     expect(workflow).not.toContain("app/desktop");
     expect(workflow).not.toContain("pull_request_target");
     expect(workflow).not.toContain("secrets.");

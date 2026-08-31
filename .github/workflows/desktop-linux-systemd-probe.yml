@@ -71,12 +71,49 @@ jobs:
       - name: Install runtime-layout deb
         run: sudo dpkg -i "$RUNNER_TEMP/open-codex-runtime.deb"
 
-      - name: Probe systemd from package-owned runtime
+      - name: Prepare systemd probe PATH
         env:
           PATH: /usr/bin:/bin
+        run: |
+          set -euo pipefail
+          dest="${RUNNER_TEMP}/ocx-systemd-path"
+          rm -rf "$dest"
+          mkdir -p "$dest"
+          required=(sh systemctl kill ps ss lsof cp)
+          forbidden=(node bun npm ocx opencodex)
+          for name in "${required[@]}"; do
+            resolved=""
+            for dir in /usr/bin /bin; do
+              candidate="${dir}/${name}"
+              if [ -x "$candidate" ] && [ ! -d "$candidate" ]; then
+                resolved="$candidate"
+                break
+              fi
+            done
+            if [ -z "$resolved" ]; then
+              echo "::error::required tool missing: ${name}"
+              exit 1
+            fi
+            real="$(readlink -f "$resolved")"
+            if [ -z "$real" ] || [ ! -x "$real" ] || [ -d "$real" ]; then
+              echo "::error::required tool is not executable: ${name}"
+              exit 1
+            fi
+            ln -s "$real" "${dest}/${name}"
+          done
+          for name in "${forbidden[@]}"; do
+            if [ -e "${dest}/${name}" ] || [ -L "${dest}/${name}" ]; then
+              echo "::error::forbidden tool in restricted PATH: ${name}"
+              exit 1
+            fi
+          done
+
+      - name: Probe systemd from package-owned runtime
+        env:
+          PATH: "${{ runner.temp }}/ocx-systemd-path"
           OCX_DESTRUCTIVE_SYSTEMD_PROBE: "1"
         run: |
-          if command -v bun >/dev/null || command -v node >/dev/null || command -v npm >/dev/null || command -v ocx >/dev/null; then
+          if command -v bun >/dev/null || command -v node >/dev/null || command -v npm >/dev/null || command -v ocx >/dev/null || command -v opencodex >/dev/null; then
             echo "::error::global JS runtime remained on PATH"
             exit 1
           fi
