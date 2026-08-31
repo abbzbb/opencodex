@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test";
-import { readdirSync, readFileSync } from "node:fs";
+import { afterEach, describe, expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   TWO_GENERATION_SUMMARY_KEYS,
@@ -11,7 +12,18 @@ import {
   distinctSuccessorVersions,
   execStartBindsRuntime,
   jsonLooksPathFree,
+  requireProxyNotReadyAfterFailedStart,
+  writeFailedReadyCli,
 } from "../scripts/probe-c-support";
+
+const tempDirs: string[] = [];
+
+afterEach(() => {
+  while (tempDirs.length > 0) {
+    const dir = tempDirs.pop();
+    if (dir && existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 function validSummary(): TwoGenerationSummary {
   return {
@@ -102,10 +114,62 @@ describe("desktop-direct two-generation probe contract", () => {
     expect(source).toContain("writeFailedReadyCli");
     expect(source).toContain("failedReady");
     expect(source).toContain("stubReadyzHit");
+    expect(source).toContain("requireProxyNotReadyAfterFailedStart");
     expect(source).not.toMatch(/chmodSync\([^)]*0o644/);
     expect(source).toContain("sourceOverlay");
     expect(source).toContain("failureFixture");
     expect(source).toContain("terminateOwnedProbeChildren");
+  });
+
+  test("cooperative stub compare-before-removes its own records on stop and signal", () => {
+    const root = mkdtempSync(join(tmpdir(), "ocx-two-gen-stub-"));
+    tempDirs.push(root);
+    mkdirSync(join(root, "src/cli"), { recursive: true });
+    writeFailedReadyCli(root, "2.36.0+fail");
+    const cli = readFileSync(join(root, "src/cli/index.ts"), "utf8");
+    expect(cli).toContain("removeDesktopDirectOwnerRecord");
+    expect(cli).toContain("removeRuntimePort");
+    expect(cli).toContain("removePid");
+    expect(cli).toContain("readDesktopDirectOwnerRecord");
+    expect(cli).toContain("publishedOwnerId");
+    expect(cli).toContain("cleanupOwnRecords");
+    expect(cli).toMatch(/process\.on\("SIGTERM", \(\) => \{ cleanupOwnRecords\(\); process\.exit\(0\); \}\)/);
+    expect(cli).toMatch(/process\.on\("SIGINT", \(\) => \{ cleanupOwnRecords\(\); process\.exit\(0\); \}\)/);
+    expect(cli.indexOf("cleanupOwnRecords()")).toBeLessThan(cli.indexOf("setTimeout(() => process.exit(0), 200)"));
+    expect(cli).not.toMatch(/chmodSync\([^)]*0o644/);
+  });
+
+  test("failed-start diagnostic is bounded code plus sanitized message category", () => {
+    expect(() => requireProxyNotReadyAfterFailedStart({
+      code: "proxy_not_ready",
+      message: "candidate readiness failed after publish",
+    })).not.toThrow();
+    expect(() => requireProxyNotReadyAfterFailedStart({
+      code: "restore_failed",
+      message: "owned live graceful stop failed",
+    })).toThrow(/failed candidate did not fail after start: restore_failed\/owned-live-graceful-stop/);
+    expect(() => requireProxyNotReadyAfterFailedStart({
+      code: "restore_failed",
+      message: "OPENCODEX_HOME Bearer not-a-real-token",
+    })).toThrow(/^failed candidate did not fail after start: restore_failed\/other$/);
+    expect(() => requireProxyNotReadyAfterFailedStart({
+      code: "not_a_code",
+      message: "owned live graceful stop failed",
+    })).toThrow(/failed candidate did not fail after start: unknown\/owned-live-graceful-stop/);
+    let leaked: Error | null = null;
+    try {
+      requireProxyNotReadyAfterFailedStart({
+        code: "restore_failed",
+        message: "OPENCODEX_HOME Bearer not-a-real-token",
+      });
+    } catch (error) {
+      leaked = error instanceof Error ? error : new Error(String(error));
+    }
+    expect(leaked).not.toBeNull();
+    expect(leaked?.message).toBe("failed candidate did not fail after start: restore_failed/other");
+    expect(leaked?.message).not.toContain("OPENCODEX_HOME");
+    expect(leaked?.message).not.toContain("Bearer");
+    expect(leaked?.message).not.toContain("not-a-real-token");
   });
 
   test("Rust shell does not publish desktop-direct owner records", () => {

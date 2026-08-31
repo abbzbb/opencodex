@@ -34,6 +34,7 @@ import {
   readStubPid,
   removeIsolatedHomes,
   requireAbsentSystemdProbeSurface,
+  requireProxyNotReadyAfterFailedStart,
   resignRuntimeTree,
   rewritePackageVersion,
   runtimeBinaryName,
@@ -496,7 +497,7 @@ export async function runLinuxDebSystemdProbe(): Promise<SystemdProbeSummary> {
     const failed = await failPromise;
     const failedParsed = validateEnvelope(failed);
     if (!failedParsed.ok || failedParsed.value.ok) fail("failed repair unexpectedly succeeded");
-    if (failedParsed.value.error?.code !== "proxy_not_ready") fail("failed candidate did not fail after start");
+    requireProxyNotReadyAfterFailedStart(failedParsed.value.error);
     if (!stubReadyzHit(env.OPENCODEX_HOME)) fail("failed candidate never served failed readyz");
     if (isProcessAlive(failedCandidatePid)) fail("failed candidate remained alive");
     if (isProcessAlive(preFailurePid)) fail("pre-failure pid remained alive");

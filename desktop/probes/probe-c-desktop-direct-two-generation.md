@@ -88,8 +88,13 @@ allocated so they cannot collide with that source version.
   `previous=old` commit only after child records and strict `/readyz`.
 - A cooperative ready-failed fixture starts, consumes the launch descriptor,
   publishes filesystem owner/runtime records, writes a `/readyz`-only hit
-  marker, and returns strict `/readyz` failed. The production operation fails
-  with `proxy_not_ready` after that start. Pre-failure PID is stopped, the
+  marker, and returns strict `/readyz` failed. After publish it retains/reads
+  that `ownerId`. On `/api/stop` and SIGTERM/SIGINT it compare-before-removes
+  its own owner, runtime-port, and pid records with the production APIs scoped
+  to that PID/`ownerId`, then exits after flushing the stop JSON. The production
+  operation fails with `proxy_not_ready` after that start. If the code differs,
+  the probe diagnostic is only the bounded error code and a fixed message
+  category. Pre-failure PID is stopped, the
   candidate PID existed and is absent afterward, the restored PID differs from
   both, restored owner records plus argv match the previous generation's exact
   canonical Bun/CLI paths, and the activation journal is absent.

@@ -90,7 +90,9 @@ the exact `exec '<bun>' '<cli>' ` token and MainPID NUL-delimited argv[0]/argv[1
 equal to those paths, the failed candidate process is absent, the journal is
 cleared, and rollback starts a new previous-generation PID. Failed repair must
 return `proxy_not_ready` after a `/readyz`-hit marker from the cooperative
-ready-failed fixture. Exact byte canaries in isolated `OPENCODEX_HOME` and
+ready-failed fixture, which compare-before-removes its own owner/runtime/pid
+records on stop and signal. A differing error code is reported as the bounded
+code plus a fixed message category only. Exact byte canaries in isolated `OPENCODEX_HOME` and
 `CODEX_HOME` (including a journal-shaped Codex file) must be unchanged after
 crash, successful repair, failed-repair rollback, stop, and uninstall.
 

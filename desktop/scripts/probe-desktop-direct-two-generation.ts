@@ -21,6 +21,7 @@ import {
   exactKeys,
   fail,
   invokeBridge,
+  requireProxyNotReadyAfterFailedStart,
   invokeInstall,
   isProcessAlive,
   isRecord,
@@ -349,7 +350,7 @@ export async function runTwoGenerationProbe(): Promise<TwoGenerationSummary> {
     const failedActivate = await failPromise;
     const failedParsed = validateEnvelope(failedActivate);
     if (!failedParsed.ok || failedParsed.value.ok) fail("failed candidate unexpectedly succeeded");
-    if (failedParsed.value.error?.code !== "proxy_not_ready") fail("failed candidate did not fail after start");
+    requireProxyNotReadyAfterFailedStart(failedParsed.value.error);
     if (!stubReadyzHit(homes.env.OPENCODEX_HOME)) fail("failed candidate never served failed readyz");
     if (isProcessAlive(failedCandidatePid)) fail("failed candidate remained alive");
     if (isProcessAlive(preFailurePid)) fail("pre-failure pid remained alive");

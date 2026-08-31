@@ -374,7 +374,7 @@ describe("linux deb systemd probe contract", () => {
     expect(source).toContain("systemdSurfacesEqual");
     expect(source).toContain("stubReadyzHit");
     expect(source).toContain("terminateOwnedProbeChildren");
-    expect(source).toContain("proxy_not_ready");
+    expect(source).toContain("requireProxyNotReadyAfterFailedStart");
     expect(source).not.toContain("restore_failed");
     expect(source).not.toMatch(/chmodSync\([^)]*0o644/);
     expect(source).not.toContain("0o644");

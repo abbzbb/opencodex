@@ -13,6 +13,7 @@ import {
   writeRuntimeManifestFile,
   type TargetTriple,
 } from "../runtime/manifest";
+import { ERROR_CODES } from "../runtime/protocol";
 
 export const LINUX_X64_TARGET = "x86_64-unknown-linux-gnu" as const;
 export const MAX_CHILD_OUTPUT_BYTES = 64 * 1024;
@@ -39,8 +40,56 @@ export function fail(message: string): never {
   throw new ProbeFailure(message);
 }
 
+const FIXED_ERROR_MESSAGE_CATEGORIES: Record<string, string> = {
+  "owned live graceful stop failed": "owned-live-graceful-stop",
+  "owned live proxy disappeared before stop": "owned-live-disappeared",
+  "owned live proxy identity changed before stop": "owned-live-identity-changed",
+  "owned live proxy bind is not loopback": "owned-live-bind",
+  "owned live proxy owner changed before stop": "owned-live-owner-changed",
+  "owned live stop seam is unavailable": "owned-live-stop-seam",
+  "owned live identity is unavailable": "owned-live-identity",
+  "rollback refused to stop a successor proxy": "rollback-successor",
+  "rollback could not prove absence": "absence-unproven",
+  "candidate readiness failed after publish": "candidate-readiness-after-publish",
+  "candidate readiness failed": "candidate-readiness",
+  "proxy readiness failed": "proxy-readiness",
+  "proxy is not ready": "proxy-not-ready",
+  "proxy bind is not loopback": "proxy-bind",
+  "owned service stop failed": "owned-service-stop",
+  "successor proxy after publish": "successor-after-publish",
+  "activation journal missing during candidate pid update": "journal-missing",
+  "activation journal could not be updated": "journal-update",
+  "activation journal could not be cleared": "journal-clear",
+  "activation journal is unreadable": "journal-unreadable",
+  "restore failed": "restore-failed",
+  "stop failed": "stop-failed",
+};
+
+export function boundedErrorCode(code: unknown): string {
+  return typeof code === "string" && (ERROR_CODES as readonly string[]).includes(code)
+    ? code
+    : "unknown";
+}
+
+export function sanitizedErrorMessageCategory(message: unknown): string {
+  if (typeof message !== "string") return "none";
+  const normalized = message.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim().toLowerCase();
+  if (normalized.length === 0) return "none";
+  if (!/^[\x20-\x7e]+$/.test(normalized)) return "other";
+  return FIXED_ERROR_MESSAGE_CATEGORIES[normalized] ?? "other";
+}
+
 export function isRecord(value: unknown): value is JsonRecord {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+export function requireProxyNotReadyAfterFailedStart(error: unknown): void {
+  const record = isRecord(error) ? error : null;
+  const code = boundedErrorCode(record?.code);
+  if (code === "proxy_not_ready") return;
+  fail(
+    `failed candidate did not fail after start: ${code}/${sanitizedErrorMessageCategory(record?.message)}`,
+  );
 }
 
 export function exactKeys(value: JsonRecord, keys: readonly string[]): boolean {
@@ -177,10 +226,27 @@ const writeMarker = async (name: string, body: string) => {
   }
 };
 await writeMarker(${JSON.stringify(STUB_PID_FILE)}, String(process.pid));
-process.on("SIGTERM", () => process.exit(0));
-process.on("SIGINT", () => process.exit(0));
-const { writePid, writeRuntimePort } = await import("../config/process-state.ts");
-const { consumeLaunchDescriptorAndPublish, DESKTOP_LAUNCH_DESCRIPTOR_ENV } = await import("../config/desktop-owner.ts");
+const { writePid, writeRuntimePort, removePid, removeRuntimePort } = await import("../config/process-state.ts");
+const {
+  consumeLaunchDescriptorAndPublish,
+  DESKTOP_LAUNCH_DESCRIPTOR_ENV,
+  readDesktopDirectOwnerRecord,
+  removeDesktopDirectOwnerRecord,
+} = await import("../config/desktop-owner.ts");
+let publishedOwnerId = null;
+let cleaned = false;
+const cleanupOwnRecords = () => {
+  if (cleaned) return;
+  cleaned = true;
+  const ownerId = publishedOwnerId;
+  if (typeof ownerId === "string" && ownerId.length > 0) {
+    try { removeDesktopDirectOwnerRecord(process.pid, ownerId); } catch {}
+  }
+  try { removeRuntimePort(process.pid); } catch {}
+  try { removePid(process.pid); } catch {}
+};
+process.on("SIGTERM", () => { cleanupOwnRecords(); process.exit(0); });
+process.on("SIGINT", () => { cleanupOwnRecords(); process.exit(0); });
 writePid(process.pid);
 writeRuntimePort({ pid: process.pid, port, hostname: "127.0.0.1" });
 let consumeState = "absent";
@@ -197,7 +263,16 @@ try {
       expectedCliPath: process.argv[1],
       runtimeVersion: ${JSON.stringify(version)},
     });
-    consumeState = published ? "ok" : "null";
+    if (published && typeof published.ownerId === "string" && published.ownerId.length > 0) {
+      publishedOwnerId = published.ownerId;
+      const owner = readDesktopDirectOwnerRecord();
+      if (owner && owner.pid === process.pid && typeof owner.ownerId === "string") {
+        publishedOwnerId = owner.ownerId;
+      }
+      consumeState = "ok";
+    } else {
+      consumeState = "null";
+    }
   }
 } catch {
   consumeState = "throw";
@@ -216,6 +291,7 @@ Bun.serve({
       if (typeof home === "string" && home.length > 0) {
         void Bun.write(home + "/probe-stub-stop-hit", "1");
       }
+      cleanupOwnRecords();
       setTimeout(() => process.exit(0), 200);
       return Response.json({ success: true, message: "Proxy stopping, native Codex restored." });
     }
