@@ -65,15 +65,16 @@ and systemd mutation.
   export PATH;` before token `cat` and `exec`, because `-lc` reloads
   `/etc/profile`. Failure logs still use `PATH=/usr/bin:/bin`
 
-## After push, observe
+## Recorded result
 
-Job `linux-deb-systemd` is **CI-pending** for the exact commit. Both of these
-must exit 0:
+Job `linux-deb-systemd` **passed** at commit
+`898e4bebf6bf61ec90e1c54e9df74be04d38a028`, run
+[33387507384](https://github.com/abbzbb/opencodex/actions/runs/33387507384)
+(2m43s). This is a runtime-layout `.deb`, not a Tauri GUI package.
 
-1. Step `Probe desktop-direct two-generation` — path-free two-generation JSON
-   (`sourceOverlay: true`, `failureFixture: cooperative-ready-failed`). See
+1. Step `Probe desktop-direct two-generation` — recorded in
    [`probe-c-desktop-direct-two-generation.md`](./probe-c-desktop-direct-two-generation.md).
-2. Step `Probe systemd from package-owned runtime` — one JSON line:
+2. Step `Probe systemd from package-owned runtime` — stdout JSON:
 
 ```json
 {
@@ -114,7 +115,7 @@ The same job's two-generation step uncovered Linux zombie liveness
 `CODEX_HOME` (including a journal-shaped Codex file) must be unchanged after
 crash, successful repair, failed-repair rollback, stop, and uninstall.
 
-Those lines are the only success evidence. Probe C stays OPEN until this job is
-green for the exact commit, and until macOS/Windows physical smokes and actual
-Tauri old/new package evidence exist. The runtime-layout `.deb` limitation stays
-explicit.
+Those lines are the recorded success evidence for this Linux runtime-layout
+slice. Probe C stays OPEN until macOS/Windows physical smokes, WebView,
+signing/updater, and actual Tauri old/new package evidence exist. The
+runtime-layout `.deb` limitation stays explicit.

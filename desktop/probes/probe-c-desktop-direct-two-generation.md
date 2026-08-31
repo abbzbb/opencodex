@@ -22,15 +22,16 @@ launch descriptor, publishes owner/runtime records, hits `/readyz` with
 `failed`, then honors `POST /api/stop`. It is not a chmod of the staged Bun
 binary and not a second packaged release.
 
-The live ready-failed rollback is **CI-pending**. It runs on GitHub-hosted
-`ubuntu-latest` in `.github/workflows/desktop-linux-systemd-probe.yml` after
-the runtime is built and before `dpkg`/systemd mutation, using
-`OCX_PROBE_RUNTIME_ROOT`. That workflow uncovered Linux `waitForExit` treating
-a zombie as alive (`kill(pid,0)` is true while `/proc/<pid>/stat` is `Z`),
-which surfaced as `restore_failed/owned-live-graceful-stop`. Production
+The live ready-failed rollback is **recorded** for commit
+`898e4bebf6bf61ec90e1c54e9df74be04d38a028` on GitHub-hosted `ubuntu-latest`
+in `.github/workflows/desktop-linux-systemd-probe.yml` job `linux-deb-systemd`
+(run [33387507384](https://github.com/abbzbb/opencodex/actions/runs/33387507384),
+2m43s), after the runtime is built and before `dpkg`/systemd mutation, using
+`OCX_PROBE_RUNTIME_ROOT`. That workflow earlier uncovered Linux `waitForExit`
+treating a zombie as alive (`kill(pid,0)` is true while `/proc/<pid>/stat` is
+`Z`), which surfaced as `restore_failed/owned-live-graceful-stop`. Production
 `isProcessAlive` now keeps `kill(pid,0)` first and, on Linux, treats `Z`/`X`
-after the final `)` in `/proc/<pid>/stat` as not alive. The same workflow
-covers that liveness once the two-generation step is green. Local host
+after the final `)` in `/proc/<pid>/stat` as not alive. Local host
 zombie/reaping is not a recorded success.
 
 ## Commands
@@ -56,10 +57,11 @@ Stdout is one JSON object. No tokens, account ids, request bodies, or user paths
 
 ## Recorded result
 
-Live two-generation ready-failed rollback: **CI-pending**. No local exit-0
-rollback result is recorded for this revision. Observe job
-`linux-deb-systemd` step `Probe desktop-direct two-generation` for the exact
-commit. The JSON shape on success is:
+Live two-generation ready-failed rollback: **pass** at commit
+`898e4bebf6bf61ec90e1c54e9df74be04d38a028`, job `linux-deb-systemd` step
+`Probe desktop-direct two-generation`, run
+[33387507384](https://github.com/abbzbb/opencodex/actions/runs/33387507384)
+(2m43s). No local exit-0 rollback result is recorded. The stdout JSON was:
 
 ```json
 {
@@ -110,7 +112,7 @@ allocated so they cannot collide with that source version.
 ## Evidence boundary
 
 This does not close Probe C. It does not prove two immutable Tauri packaged
-releases, macOS launchd, Windows scheduler/WinSW, Linux `.deb` systemd
-user-service smoke, WebView, or autoupdate. The Linux `.deb` systemd slice is
-in the same workflow after this step and is separately unproven until that
-step is green for the exact commit.
+releases, macOS launchd, Windows scheduler/WinSW, WebView, signing, or
+autoupdate. The Linux runtime-layout `.deb` systemd slice is recorded in
+[`probe-c-linux-deb-systemd.md`](./probe-c-linux-deb-systemd.md) from the same
+run; that package is not a Tauri GUI package.

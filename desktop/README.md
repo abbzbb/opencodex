@@ -163,17 +163,18 @@ desktop-direct probe is in
 That probe is source-overlay live-process evidence (packaged payload plus current
 `desktop/runtime` and `src`), not two immutable packaged Desktop releases. Actual
 Tauri old/new package evidence remains OPEN. The live ready-failed rollback and
-the Linux `.deb` systemd user-service smoke are both CI-only in
-`.github/workflows/desktop-linux-systemd-probe.yml`
-([`probe-c-linux-deb-systemd.md`](./probes/probe-c-linux-deb-systemd.md)); the
-`.deb` is a runtime-layout package, unproven until that workflow is green, and
-is not macOS/Windows or Tauri GUI evidence. The systemd step PATH is a private
-`RUNNER_TEMP` allowlist, re-exported inside the step so `GITHUB_PATH` from
-setup-bun cannot prepend `bun` (step env PATH alone is not the live PATH).
-That workflow also covers Linux zombie liveness (`/proc/<pid>/stat` `Z`/`X`
-after `kill(pid,0)`), which it uncovered as
-`restore_failed/owned-live-graceful-stop`. Probe C remains OPEN. The
-service-path / global-stop shared-lock race remains WATCH.
+the Linux runtime-layout `.deb` systemd user-service smoke are recorded pass
+for commit `898e4bebf6bf61ec90e1c54e9df74be04d38a028` in
+`.github/workflows/desktop-linux-systemd-probe.yml` job `linux-deb-systemd`
+(run [33387507384](https://github.com/abbzbb/opencodex/actions/runs/33387507384),
+2m43s; [`probe-c-linux-deb-systemd.md`](./probes/probe-c-linux-deb-systemd.md)).
+The `.deb` is a runtime-layout package, not macOS/Windows or Tauri GUI
+evidence. The systemd step PATH is a private `RUNNER_TEMP` allowlist,
+re-exported inside the step so `GITHUB_PATH` from setup-bun cannot prepend
+`bun` (step env PATH alone is not the live PATH). That workflow also covers
+Linux zombie liveness (`/proc/<pid>/stat` `Z`/`X` after `kill(pid,0)`), which
+it uncovered as `restore_failed/owned-live-graceful-stop`. Probe C remains
+OPEN. The service-path / global-stop shared-lock race remains WATCH.
 
 Neither Linux `.deb` probe is WebView, session/CSRF, or navigation evidence.
 The post-install probe directly asserted no Codex CLI and checked the full
