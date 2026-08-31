@@ -683,6 +683,7 @@ describe("GitHub Actions hardening", () => {
     expect(required).toContain("ss");
     expect(required).toContain("lsof");
     expect(required).toContain("cp");
+    expect(required).toContain("cat");
     expect(required).not.toContain("node");
     expect(required).not.toContain("bun");
     expect(required).not.toContain("npm");
@@ -696,7 +697,15 @@ describe("GitHub Actions hardening", () => {
     expect(prep).not.toContain("${{");
     expect(steps[probeIdx]!.env?.PATH).toBe("${{ runner.temp }}/ocx-systemd-path");
     expect(steps[probeIdx]!.env?.PATH).not.toContain("/usr/bin");
-    expect(steps[probeIdx]!.run).toContain("/usr/bin/ocx-runtime");
+    const probeRun = steps[probeIdx]!.run ?? "";
+    expect(probeRun).toContain('allow="${RUNNER_TEMP}/ocx-systemd-path"');
+    expect(probeRun).toContain('export PATH="$allow"');
+    expect(probeRun).toContain("hash -r");
+    expect(probeRun.indexOf("export PATH=")).toBeLessThan(probeRun.indexOf("command -v"));
+    expect(probeRun).toContain("for name in bun node npm ocx opencodex");
+    expect(probeRun).toContain("global JS runtime remained on PATH: ${name} -> ${resolved}");
+    expect(probeRun).toContain("/usr/bin/ocx-runtime");
+    expect(probeRun).not.toContain("command -v bun >/dev/null || command -v node");
     expect(steps[diagIdx]!.env?.PATH).toBe("/usr/bin:/bin");
     expect(workflow).not.toContain("app/desktop");
     expect(workflow).not.toContain("pull_request_target");

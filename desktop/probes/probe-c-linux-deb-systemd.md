@@ -50,15 +50,20 @@ and systemd mutation.
 - two-generation live probe runs after the runtime build, before `dpkg`
 - after `dpkg -i`, a prepare step writes a private directory under
   `RUNNER_TEMP` with symlinks for a fixed allowlist (`sh`, `systemctl`,
-  `kill`, `ps`, `ss`, `lsof`, `cp`) resolved from `/usr/bin` then `/bin`; it fails
+  `kill`, `ps`, `ss`, `lsof`, `cp`, `cat`) resolved from `/usr/bin` then `/bin`; it fails
   if any required tool is missing and does not include `node`, `bun`, `npm`,
   `ocx`, or `opencodex`
-- systemd smoke sets `PATH` to only that private directory,
-  `OCX_DESTRUCTIVE_SYSTEMD_PROBE=1`, and invokes `/usr/bin/ocx-runtime`
-  absolutely; after the CI and no-global-runtime gates the probe copies
-  `process.env.PATH` onto `env.PATH` so install/bridge/direct children and the
-  systemd unit inherit the same restricted PATH; failure logs still use
-  `PATH=/usr/bin:/bin`
+- systemd smoke sets step env `PATH` to that private directory and, inside the
+  step, exports `PATH` to it again (`GITHUB_PATH` from setup-bun is prepended
+  to the live PATH even when step env PATH is the allowlist). It then checks
+  `bun`/`node`/`npm`/`ocx`/`opencodex` one at a time so a hit names the
+  command and its resolved path. `OCX_DESTRUCTIVE_SYSTEMD_PROBE=1`, and
+  `/usr/bin/ocx-runtime` is invoked absolutely. After the CI and
+  no-global-runtime gates the probe copies `process.env.PATH` onto `env.PATH`
+  so install/bridge/direct children and the systemd unit inherit the same
+  restricted PATH. The unit still uses `/bin/sh -lc`, then `PATH=<baked>;
+  export PATH;` before token `cat` and `exec`, because `-lc` reloads
+  `/etc/profile`. Failure logs still use `PATH=/usr/bin:/bin`
 
 ## After push, observe
 
@@ -95,8 +100,10 @@ Independently of that JSON, the systemd step must prove after crash, repair
 success, and repair rollback: MainPID changed, exact owner/version plus strict
 `/readyz`, the full current/previous pointer pair, loaded `ExecStart` bound to
 the exact `exec '<bun>' '<cli>' ` token and MainPID NUL-delimited argv[0]/argv[1]
-equal to those paths, the failed candidate process is absent, the journal is
-cleared, and rollback starts a new previous-generation PID. Failed repair must
+equal to those paths, `/proc/<MainPID>/environ` PATH equal to the restricted
+allowlist PATH (so `/bin/sh -lc` profile restore did not regain `/usr/bin:/bin`),
+the failed candidate process is absent, the journal is cleared, and rollback
+starts a new previous-generation PID. Failed repair must
 return `proxy_not_ready` after a `/readyz`-hit marker from the cooperative
 ready-failed fixture, which compare-before-removes its own owner/runtime/pid
 records on stop and signal and writes `probe-stub-cleanup` `ok`. A differing

@@ -2690,7 +2690,9 @@ export function buildUnit(
     opencodexHome,
     ...proxyEnv.map(({ name, value }) => systemdEnvironmentAssignment(name, value)),
   ].filter((line): line is string => Boolean(line)).join("\n");
-  const command = `${buildServiceShellCommand(bun, cli)} >> ${shellQuote(log)} 2>&1`;
+  // /bin/sh -lc reloads /etc/profile and can restore /usr/bin:/bin; reset PATH
+  // after login init and before token cat / exec so MainPID keeps the baked PATH.
+  const command = `PATH=${shellQuote(path)}; export PATH; ${buildServiceShellCommand(bun, cli)} >> ${shellQuote(log)} 2>&1`;
   return `[Unit]
 Description=OpenCodex Proxy Server
 After=network-online.target

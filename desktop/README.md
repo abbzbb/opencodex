@@ -168,9 +168,10 @@ the Linux `.deb` systemd user-service smoke are both CI-only in
 ([`probe-c-linux-deb-systemd.md`](./probes/probe-c-linux-deb-systemd.md)); the
 `.deb` is a runtime-layout package, unproven until that workflow is green, and
 is not macOS/Windows or Tauri GUI evidence. The systemd step PATH is a private
-`RUNNER_TEMP` allowlist (not `/usr/bin:/bin`, which still has `node` on GitHub
-ubuntu). That workflow also covers Linux zombie liveness (`/proc/<pid>/stat`
-`Z`/`X` after `kill(pid,0)`), which it uncovered as
+`RUNNER_TEMP` allowlist, re-exported inside the step so `GITHUB_PATH` from
+setup-bun cannot prepend `bun` (step env PATH alone is not the live PATH).
+That workflow also covers Linux zombie liveness (`/proc/<pid>/stat` `Z`/`X`
+after `kill(pid,0)`), which it uncovered as
 `restore_failed/owned-live-graceful-stop`. Probe C remains OPEN. The
 service-path / global-stop shared-lock race remains WATCH.
 

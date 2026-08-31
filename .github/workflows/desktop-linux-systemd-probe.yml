@@ -79,7 +79,7 @@ jobs:
           dest="${RUNNER_TEMP}/ocx-systemd-path"
           rm -rf "$dest"
           mkdir -p "$dest"
-          required=(sh systemctl kill ps ss lsof cp)
+          required=(sh systemctl kill ps ss lsof cp cat)
           forbidden=(node bun npm ocx opencodex)
           for name in "${required[@]}"; do
             resolved=""
@@ -113,10 +113,27 @@ jobs:
           PATH: "${{ runner.temp }}/ocx-systemd-path"
           OCX_DESTRUCTIVE_SYSTEMD_PROBE: "1"
         run: |
-          if command -v bun >/dev/null || command -v node >/dev/null || command -v npm >/dev/null || command -v ocx >/dev/null || command -v opencodex >/dev/null; then
-            echo "::error::global JS runtime remained on PATH"
+          set -euo pipefail
+          allow="${RUNNER_TEMP}/ocx-systemd-path"
+          if [ ! -d "$allow" ]; then
+            echo "::error::restricted PATH directory is missing"
             exit 1
           fi
+          # Step env PATH is not the live PATH: the runner prepends GITHUB_PATH
+          # from setup-bun, so bun remains visible unless we export the allowlist.
+          export PATH="$allow"
+          hash -r
+          if [ "$PATH" != "$allow" ]; then
+            echo "::error::PATH was not restricted to the allowlist directory"
+            exit 1
+          fi
+          for name in bun node npm ocx opencodex; do
+            resolved="$(command -v "$name" || true)"
+            if [ -n "$resolved" ]; then
+              echo "::error::global JS runtime remained on PATH: ${name} -> ${resolved}"
+              exit 1
+            fi
+          done
           /usr/bin/ocx-runtime "$GITHUB_WORKSPACE/desktop/scripts/probe-linux-deb-systemd.ts"
 
       - name: Bounded failure diagnostics

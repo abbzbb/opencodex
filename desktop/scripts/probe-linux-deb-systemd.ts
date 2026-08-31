@@ -29,6 +29,7 @@ import {
   invokeInstall,
   isProcessAlive,
   isRecord,
+  linuxProcEnvironValue,
   jsonLooksPathFree,
   overlayCurrentDesktopRuntime,
   readStubPid,
@@ -155,6 +156,18 @@ function mainPid(): number {
   const pid = Number.parseInt(shown.stdout.trim(), 10);
   if (!Number.isSafeInteger(pid) || pid <= 0) fail("systemd MainPID is missing");
   return pid;
+}
+
+function requireMainPidRestrictedPath(pid: number, expectedPath: string): void {
+  let raw: Buffer;
+  try {
+    raw = readFileSync(`/proc/${pid}/environ`);
+  } catch {
+    fail("cannot read MainPID environ");
+  }
+  const live = linuxProcEnvironValue(raw, "PATH");
+  if (live === null) fail("MainPID PATH is missing");
+  if (live !== expectedPath) fail("MainPID PATH is not the restricted PATH");
 }
 
 function generationRoot(stableRoot: string, version: string): string {
@@ -312,6 +325,8 @@ async function requireServiceReady(
   if (result.owner !== "desktop-service" || result.status !== "ready") fail("service is not ready");
   if (result.version !== expected.version) fail("service version mismatch");
   if (result.pid !== expected.pid) fail("status pid does not match MainPID");
+  if (typeof env.PATH !== "string" || env.PATH.length === 0) fail("restricted PATH is missing");
+  requireMainPidRestrictedPath(expected.pid, env.PATH);
   requirePointerPair(expected.stableRoot, expected.currentId, expected.previousId, expected.version);
   requireLoadedStablePaths(expected.bunPath, expected.cliPath);
   if (!cmdlineMatchesRuntime(expected.pid, expected.bunPath, expected.cliPath)) {

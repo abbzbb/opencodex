@@ -20,6 +20,7 @@ import {
   entryExists,
   interpretSystemdShow,
   jsonLooksPathFree,
+  linuxProcEnvironValue,
   managerFlagsFromStates,
   requireAbsentSystemdProbeSurface,
   systemdManagerFlagsForCleanup,
@@ -144,6 +145,14 @@ describe("linux deb systemd probe contract", () => {
       isolatedServiceStateExists: true,
     })).toThrow(/isolated service-state/);
     expect(() => requireAbsentSystemdProbeSurface(absentSurface())).not.toThrow();
+  });
+
+  test("parses PATH from Linux /proc environ bytes", () => {
+    expect(linuxProcEnvironValue("HOME=/tmp\0PATH=/tmp/ocx-systemd-path\0LANG=C\0", "PATH"))
+      .toBe("/tmp/ocx-systemd-path");
+    expect(linuxProcEnvironValue("PATH=/usr/bin:/bin\0HOME=/tmp\0", "PATH")).toBe("/usr/bin:/bin");
+    expect(linuxProcEnvironValue("HOME=/tmp\0", "PATH")).toBeNull();
+    expect(linuxProcEnvironValue(new TextEncoder().encode("PATH=/tmp/allow\0"), "PATH")).toBe("/tmp/allow");
   });
 
   test("strict systemctl observation fails closed before mutation", () => {
@@ -379,6 +388,11 @@ describe("linux deb systemd probe contract", () => {
     expect(source).toContain("env.PATH = restrictedPath");
     expect(source).toContain("process.env.PATH");
     expect(source).toContain("restricted PATH is missing");
+    expect(source).toContain("requireMainPidRestrictedPath");
+    expect(source).toContain("/proc/");
+    expect(source).toContain("environ");
+    expect(source).toContain("linuxProcEnvironValue");
+    expect(source).toContain("MainPID PATH is not the restricted PATH");
     expect(source).not.toContain("/usr/bin:/bin");
     expect(source).not.toContain("restore_failed");
     expect(source).not.toMatch(/chmodSync\([^)]*0o644/);

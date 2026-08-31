@@ -93,6 +93,15 @@ export function requireProxyNotReadyAfterFailedStart(error: unknown): void {
   );
 }
 
+export function linuxProcEnvironValue(raw: string | Uint8Array, key: string): string | null {
+  const text = typeof raw === "string" ? raw : new TextDecoder("utf-8").decode(raw);
+  const prefix = `${key}=`;
+  for (const entry of text.split("\0")) {
+    if (entry.startsWith(prefix)) return entry.slice(prefix.length);
+  }
+  return null;
+}
+
 export function exactKeys(value: JsonRecord, keys: readonly string[]): boolean {
   const actual = Object.keys(value);
   return actual.length === keys.length

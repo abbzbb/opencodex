@@ -193,6 +193,46 @@ describe("systemd service unit", () => {
     expect(unit).not.toContain("StandardError=");
   });
 
+  test("systemd ExecStart resets PATH after login shell init and before token cat", () => {
+    const previousPath = process.env.PATH;
+    const baked = "/tmp/ocx-restricted-path";
+    try {
+      process.env.PATH = baked;
+      const unit = buildUnit();
+      const execLine = unit.split("\n").find(line => line.startsWith("ExecStart=")) ?? "";
+      expect(execLine).toContain('ExecStart="/bin/sh" -lc ');
+      const afterLc = execLine.slice(execLine.indexOf(" -lc "));
+      const pathAssign = afterLc.indexOf("PATH='/tmp/ocx-restricted-path'");
+      const pathExport = afterLc.indexOf("export PATH;");
+      const cat = afterLc.indexOf("$(cat ");
+      const exec = afterLc.indexOf(" exec ");
+      expect(pathAssign).toBeGreaterThan(0);
+      expect(pathExport).toBeGreaterThan(pathAssign);
+      expect(cat).toBeGreaterThan(pathExport);
+      expect(exec).toBeGreaterThan(cat);
+      expect(unit).toContain('Environment="PATH=/tmp/ocx-restricted-path"');
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  });
+
+  test("systemd ExecStart shell-quotes the baked PATH reset", () => {
+    const previousPath = process.env.PATH;
+    const baked = "/tmp/ocx restricted$path";
+    try {
+      process.env.PATH = baked;
+      const unit = buildUnit();
+      const execLine = unit.split("\n").find(line => line.startsWith("ExecStart=")) ?? "";
+      const afterLc = execLine.slice(execLine.indexOf(" -lc "));
+      expect(afterLc).toContain("PATH='/tmp/ocx restricted$path'");
+      expect(afterLc.indexOf("PATH='/tmp/ocx restricted$path'")).toBeLessThan(afterLc.indexOf("$(cat "));
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  });
+
   test("bakes outbound proxy env into the unit so the service is not cut off from upstream (#2107)", () => {
     // systemd does not inherit the installing shell's environment, and ExecStart runs
     // /bin/sh -lc — which is dash on Ubuntu/WSL and reads .profile, not .bashrc. A user
