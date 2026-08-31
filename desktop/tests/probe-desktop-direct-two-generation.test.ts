@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -13,6 +13,9 @@ import {
   execStartBindsRuntime,
   jsonLooksPathFree,
   requireProxyNotReadyAfterFailedStart,
+  requireStubCleanupOk,
+  STUB_CLEANUP_FILE,
+  stubCleanupMarkerBody,
   writeFailedReadyCli,
 } from "../scripts/probe-c-support";
 
@@ -115,6 +118,7 @@ describe("desktop-direct two-generation probe contract", () => {
     expect(source).toContain("failedReady");
     expect(source).toContain("stubReadyzHit");
     expect(source).toContain("requireProxyNotReadyAfterFailedStart");
+    expect(source).toContain("requireStubCleanupOk");
     expect(source).not.toMatch(/chmodSync\([^)]*0o644/);
     expect(source).toContain("sourceOverlay");
     expect(source).toContain("failureFixture");
@@ -133,10 +137,77 @@ describe("desktop-direct two-generation probe contract", () => {
     expect(cli).toContain("readDesktopDirectOwnerRecord");
     expect(cli).toContain("publishedOwnerId");
     expect(cli).toContain("cleanupOwnRecords");
+    expect(cli).toContain("cleanupSucceeded");
+    expect(cli).toContain("cleanupSucceeded = false");
+    expect(cli.split("cleanupSucceeded = false").length - 1).toBeGreaterThanOrEqual(3);
+    expect(cli).toContain("removeDesktopDirectOwnerRecord(process.pid, ownerId) === false");
+    expect(cli).toContain("readDesktopDirectOwnerRecord");
+    expect(cli).toContain("owner.pid === process.pid");
+    expect(cli).toContain("owner.ownerId === ownerId");
+    expect(cli).toContain("readRuntimePort(process.pid)");
+    expect(cli).toContain("readPid() === process.pid");
+    expect(cli).toContain(STUB_CLEANUP_FILE);
+    expect(cli).toContain('cleanupSucceeded ? "ok" : "failed"');
+    expect(cli).not.toMatch(/catch\s*(?:\([^)]*\))?\s*\{\s*\}/);
     expect(cli).toMatch(/process\.on\("SIGTERM", \(\) => \{ cleanupOwnRecords\(\); process\.exit\(0\); \}\)/);
     expect(cli).toMatch(/process\.on\("SIGINT", \(\) => \{ cleanupOwnRecords\(\); process\.exit\(0\); \}\)/);
     expect(cli.indexOf("cleanupOwnRecords()")).toBeLessThan(cli.indexOf("setTimeout(() => process.exit(0), 200)"));
+    expect(cli.indexOf("writeFileSync")).toBeLessThan(cli.indexOf("process.exit(0)"));
     expect(cli).not.toMatch(/chmodSync\([^)]*0o644/);
+  });
+
+  test("ineffective nonthrowing deletion yields a failed cleanup marker", () => {
+    const gone = {
+      owner: null,
+      runtimePortForPid: null,
+      pidRead: null,
+      selfPid: 4242,
+      publishedOwnerId: "aa".repeat(16),
+    };
+    expect(stubCleanupMarkerBody({ ...gone, ownerRemoveReturnedFalse: false })).toBe("ok");
+    expect(stubCleanupMarkerBody({ ...gone, ownerRemoveReturnedFalse: true })).toBe("failed");
+    expect(stubCleanupMarkerBody({
+      ownerRemoveReturnedFalse: false,
+      owner: { pid: 4242, ownerId: gone.publishedOwnerId },
+      runtimePortForPid: null,
+      pidRead: null,
+      selfPid: 4242,
+      publishedOwnerId: gone.publishedOwnerId,
+    })).toBe("failed");
+    expect(stubCleanupMarkerBody({
+      ownerRemoveReturnedFalse: false,
+      owner: null,
+      runtimePortForPid: { pid: 4242 },
+      pidRead: null,
+      selfPid: 4242,
+      publishedOwnerId: gone.publishedOwnerId,
+    })).toBe("failed");
+    expect(stubCleanupMarkerBody({
+      ownerRemoveReturnedFalse: false,
+      owner: null,
+      runtimePortForPid: null,
+      pidRead: 4242,
+      selfPid: 4242,
+      publishedOwnerId: gone.publishedOwnerId,
+    })).toBe("failed");
+    expect(stubCleanupMarkerBody({
+      ownerRemoveReturnedFalse: false,
+      owner: { pid: 99, ownerId: gone.publishedOwnerId },
+      runtimePortForPid: null,
+      pidRead: 7,
+      selfPid: 4242,
+      publishedOwnerId: gone.publishedOwnerId,
+    })).toBe("ok");
+  });
+
+  test("cleanup marker helper accepts only ok", () => {
+    const root = mkdtempSync(join(tmpdir(), "ocx-two-gen-cleanup-"));
+    tempDirs.push(root);
+    expect(() => requireStubCleanupOk(root)).toThrow(/cleanup marker is missing/);
+    writeFileSync(join(root, STUB_CLEANUP_FILE), "failed\n");
+    expect(() => requireStubCleanupOk(root)).toThrow(/cleanup marker is failed/);
+    writeFileSync(join(root, STUB_CLEANUP_FILE), "ok\n");
+    expect(() => requireStubCleanupOk(root)).not.toThrow();
   });
 
   test("failed-start diagnostic is bounded code plus sanitized message category", () => {

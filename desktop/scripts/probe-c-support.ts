@@ -21,6 +21,7 @@ export const VERSION_RE = /^[A-Za-z0-9._+-]{1,64}$/;
 export const STUB_PID_FILE = "probe-stub-pid";
 export const STUB_CONSUME_FILE = "probe-stub-consumed";
 export const STUB_READYZ_FILE = "probe-stub-readyz-hit";
+export const STUB_CLEANUP_FILE = "probe-stub-cleanup";
 export const DESTRUCTIVE_SYSTEMD_PROBE_ENV = "OCX_DESTRUCTIVE_SYSTEMD_PROBE";
 export const OCX_CONFIG_CANARY_REL = "user-config-canary";
 export const CODEX_JOURNAL_CANARY_REL = "probe-canary.jsonl";
@@ -226,7 +227,8 @@ const writeMarker = async (name: string, body: string) => {
   }
 };
 await writeMarker(${JSON.stringify(STUB_PID_FILE)}, String(process.pid));
-const { writePid, writeRuntimePort, removePid, removeRuntimePort } = await import("../config/process-state.ts");
+const { writeFileSync } = await import("node:fs");
+const { writePid, writeRuntimePort, removePid, removeRuntimePort, readPid, readRuntimePort } = await import("../config/process-state.ts");
 const {
   consumeLaunchDescriptorAndPublish,
   DESKTOP_LAUNCH_DESCRIPTOR_ENV,
@@ -238,12 +240,28 @@ let cleaned = false;
 const cleanupOwnRecords = () => {
   if (cleaned) return;
   cleaned = true;
+  let cleanupSucceeded = true;
   const ownerId = publishedOwnerId;
   if (typeof ownerId === "string" && ownerId.length > 0) {
-    try { removeDesktopDirectOwnerRecord(process.pid, ownerId); } catch {}
+    try {
+      if (removeDesktopDirectOwnerRecord(process.pid, ownerId) === false) cleanupSucceeded = false;
+    } catch { cleanupSucceeded = false; }
   }
-  try { removeRuntimePort(process.pid); } catch {}
-  try { removePid(process.pid); } catch {}
+  try { removeRuntimePort(process.pid); } catch { cleanupSucceeded = false; }
+  try { removePid(process.pid); } catch { cleanupSucceeded = false; }
+  try {
+    const owner = readDesktopDirectOwnerRecord();
+    if (owner && owner.pid === process.pid && typeof ownerId === "string" && ownerId.length > 0 && owner.ownerId === ownerId) {
+      cleanupSucceeded = false;
+    }
+    if (readRuntimePort(process.pid) !== null) cleanupSucceeded = false;
+    if (readPid() === process.pid) cleanupSucceeded = false;
+  } catch { cleanupSucceeded = false; }
+  if (typeof home === "string" && home.length > 0) {
+    try {
+      writeFileSync(home + "/" + ${JSON.stringify(STUB_CLEANUP_FILE)}, cleanupSucceeded ? "ok" : "failed");
+    } catch { cleanupSucceeded = false; }
+  }
 };
 process.on("SIGTERM", () => { cleanupOwnRecords(); process.exit(0); });
 process.on("SIGINT", () => { cleanupOwnRecords(); process.exit(0); });
@@ -415,8 +433,60 @@ export function stubReadyzHit(opencodexHome: string): boolean {
   }
 }
 
+export function readStubCleanup(opencodexHome: string): "ok" | "failed" | null {
+  try {
+    const raw = readFileSync(join(opencodexHome, STUB_CLEANUP_FILE), "utf8").trim();
+    if (raw === "ok" || raw === "failed") return raw;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export function requireStubCleanupOk(opencodexHome: string): void {
+  const state = readStubCleanup(opencodexHome);
+  if (state === "ok") return;
+  fail(state === "failed"
+    ? "failed candidate cleanup marker is failed"
+    : "failed candidate cleanup marker is missing");
+}
+
+export type StubCleanupObservation = {
+  ownerRemoveReturnedFalse: boolean;
+  owner: { pid: number; ownerId: string } | null;
+  runtimePortForPid: { pid: number } | null;
+  pidRead: number | null;
+  selfPid: number;
+  publishedOwnerId: string | null;
+};
+
+export function stubCleanupRecordsStillOwned(input: {
+  owner: { pid: number; ownerId: string } | null;
+  runtimePortForPid: { pid: number } | null;
+  pidRead: number | null;
+  selfPid: number;
+  publishedOwnerId: string | null;
+}): boolean {
+  if (
+    input.owner
+    && input.owner.pid === input.selfPid
+    && typeof input.publishedOwnerId === "string"
+    && input.publishedOwnerId.length > 0
+    && input.owner.ownerId === input.publishedOwnerId
+  ) return true;
+  if (input.runtimePortForPid !== null) return true;
+  if (input.pidRead === input.selfPid) return true;
+  return false;
+}
+
+export function stubCleanupMarkerBody(input: StubCleanupObservation): "ok" | "failed" {
+  if (input.ownerRemoveReturnedFalse) return "failed";
+  if (stubCleanupRecordsStillOwned(input)) return "failed";
+  return "ok";
+}
+
 export function clearFailedCandidateMarkers(opencodexHome: string): void {
-  for (const name of [STUB_PID_FILE, STUB_CONSUME_FILE, STUB_READYZ_FILE]) {
+  for (const name of [STUB_PID_FILE, STUB_CONSUME_FILE, STUB_READYZ_FILE, STUB_CLEANUP_FILE]) {
     try { rmSync(join(opencodexHome, name)); } catch { /* absent */ }
   }
 }

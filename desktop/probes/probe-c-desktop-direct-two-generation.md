@@ -25,8 +25,13 @@ binary and not a second packaged release.
 The live ready-failed rollback is **CI-pending**. It runs on GitHub-hosted
 `ubuntu-latest` in `.github/workflows/desktop-linux-systemd-probe.yml` after
 the runtime is built and before `dpkg`/systemd mutation, using
-`OCX_PROBE_RUNTIME_ROOT`. Local host zombie/reaping is an environment
-limitation, not a recorded success.
+`OCX_PROBE_RUNTIME_ROOT`. That workflow uncovered Linux `waitForExit` treating
+a zombie as alive (`kill(pid,0)` is true while `/proc/<pid>/stat` is `Z`),
+which surfaced as `restore_failed/owned-live-graceful-stop`. Production
+`isProcessAlive` now keeps `kill(pid,0)` first and, on Linux, treats `Z`/`X`
+after the final `)` in `/proc/<pid>/stat` as not alive. The same workflow
+covers that liveness once the two-generation step is green. Local host
+zombie/reaping is not a recorded success.
 
 ## Commands
 
@@ -91,10 +96,11 @@ allocated so they cannot collide with that source version.
   marker, and returns strict `/readyz` failed. After publish it retains/reads
   that `ownerId`. On `/api/stop` and SIGTERM/SIGINT it compare-before-removes
   its own owner, runtime-port, and pid records with the production APIs scoped
-  to that PID/`ownerId`, then exits after flushing the stop JSON. The production
-  operation fails with `proxy_not_ready` after that start. If the code differs,
-  the probe diagnostic is only the bounded error code and a fixed message
-  category. Pre-failure PID is stopped, the
+  to that PID/`ownerId`, writes `probe-stub-cleanup` as `ok` or `failed`, then
+  exits after flushing the stop JSON. The production operation fails with
+  `proxy_not_ready` after that start, and the cleanup marker must be `ok`. If
+  the code differs, the probe diagnostic is only the bounded error code and a
+  fixed message category. Pre-failure PID is stopped, the
   candidate PID existed and is absent afterward, the restored PID differs from
   both, restored owner records plus argv match the previous generation's exact
   canonical Bun/CLI paths, and the activation journal is absent.

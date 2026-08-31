@@ -22,6 +22,7 @@ import {
   fail,
   invokeBridge,
   requireProxyNotReadyAfterFailedStart,
+  requireStubCleanupOk,
   invokeInstall,
   isProcessAlive,
   isRecord,
@@ -351,6 +352,7 @@ export async function runTwoGenerationProbe(): Promise<TwoGenerationSummary> {
     const failedParsed = validateEnvelope(failedActivate);
     if (!failedParsed.ok || failedParsed.value.ok) fail("failed candidate unexpectedly succeeded");
     requireProxyNotReadyAfterFailedStart(failedParsed.value.error);
+    requireStubCleanupOk(homes.env.OPENCODEX_HOME);
     if (!stubReadyzHit(homes.env.OPENCODEX_HOME)) fail("failed candidate never served failed readyz");
     if (isProcessAlive(failedCandidatePid)) fail("failed candidate remained alive");
     if (isProcessAlive(preFailurePid)) fail("pre-failure pid remained alive");

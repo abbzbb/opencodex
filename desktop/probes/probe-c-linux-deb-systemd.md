@@ -91,8 +91,11 @@ equal to those paths, the failed candidate process is absent, the journal is
 cleared, and rollback starts a new previous-generation PID. Failed repair must
 return `proxy_not_ready` after a `/readyz`-hit marker from the cooperative
 ready-failed fixture, which compare-before-removes its own owner/runtime/pid
-records on stop and signal. A differing error code is reported as the bounded
-code plus a fixed message category only. Exact byte canaries in isolated `OPENCODEX_HOME` and
+records on stop and signal and writes `probe-stub-cleanup` `ok`. A differing
+error code is reported as the bounded code plus a fixed message category only.
+The same job's two-generation step uncovered Linux zombie liveness
+(`restore_failed/owned-live-graceful-stop`); `isProcessAlive` now treats
+`/proc/<pid>/stat` `Z`/`X` as not alive after `kill(pid,0)`. Exact byte canaries in isolated `OPENCODEX_HOME` and
 `CODEX_HOME` (including a journal-shaped Codex file) must be unchanged after
 crash, successful repair, failed-repair rollback, stop, and uninstall.
 
