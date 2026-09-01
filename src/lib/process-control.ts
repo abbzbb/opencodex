@@ -1,15 +1,49 @@
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { loadConfig } from "../config";
 import { readRuntimePort } from "../config/process-state";
 import { configuredAdminToken } from "./admin-secrets";
 
+/**
+ * Process state from Linux `/proc/<pid>/stat`. Comm may contain parentheses, so
+ * the state is the first letter after the final closing parenthesis.
+ */
+export function linuxProcStatState(stat: string): string | null {
+  const close = stat.lastIndexOf(")");
+  if (close < 0) return null;
+  const rest = stat.slice(close + 1).trimStart();
+  const state = rest[0];
+  if (state === undefined || !/[A-Za-z]/.test(state)) return null;
+  return state;
+}
+
+export function linuxProcStateMeansAlive(state: string): boolean {
+  return state !== "Z" && state !== "X" && state !== "x";
+}
+
+export function linuxProcStatReadErrorMeansAlive(error: unknown): boolean {
+  const code = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+  return code !== "ENOENT" && code !== "ESRCH";
+}
+
+function linuxPidIsAliveAfterSignalZero(pid: number): boolean {
+  try {
+    const state = linuxProcStatState(readFileSync(`/proc/${pid}/stat`, "utf8"));
+    if (state === null) return true;
+    return linuxProcStateMeansAlive(state);
+  } catch (error) {
+    return linuxProcStatReadErrorMeansAlive(error);
+  }
+}
+
 export function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
-    return true;
   } catch {
     return false;
   }
+  if (process.platform !== "linux") return true;
+  return linuxPidIsAliveAfterSignalZero(pid);
 }
 
 export function waitForExit(pid: number, timeoutMs: number): boolean {

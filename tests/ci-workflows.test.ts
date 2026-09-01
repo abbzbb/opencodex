@@ -427,6 +427,7 @@ describe("GitHub Actions hardening", () => {
     const ciPaths = [
       ".gitattributes",
       ".github/workflows/ci.yml",
+      ".github/workflows/desktop-reload-generation.yml",
       ".github/workflows/enforce-pr-target.yml",
       ".github/workflows/release.yml",
       ".github/workflows/stale-needs-info.yml",
@@ -613,6 +614,237 @@ describe("GitHub Actions hardening", () => {
     expect(stale.with?.["exempt-issue-labels"]).toBeUndefined();
     expect(stale.with?.["remove-stale-when-updated"]).toBe(true);
     expect(text).not.toMatch(/uses:\s+\S+@(?:v\d+|main|master)\b/);
+  });
+
+  test("desktop linux systemd probe is least-privilege, SHA-pinned, and package-owned", async () => {
+    const workflow = await readText(".github/workflows/desktop-linux-systemd-probe.yml");
+    const parsed = Bun.YAML.parse(workflow) as {
+      on?: {
+        pull_request?: { paths?: string[]; branches?: string[] };
+        push?: { paths?: string[]; branches?: string[] };
+      };
+    };
+    const expectedPaths = [
+      "src/**",
+      "package.json",
+      "bun.lock",
+      "gui/**",
+      "desktop/**",
+      ".github/workflows/desktop-linux-systemd-probe.yml",
+      ".github/actions/setup-project-bun/action.yml",
+    ];
+    expect([...(parsed.on?.pull_request?.paths ?? [])]).toEqual(expectedPaths);
+    expect([...(parsed.on?.push?.paths ?? [])]).toEqual(expectedPaths);
+    expect([...(parsed.on?.push?.branches ?? [])].sort()).toEqual(["dev", "main", "preview"]);
+    expect(parsed.on?.push?.branches ?? []).not.toContain("app/desktop");
+    expect(workflow).toContain("permissions:\n  contents: read");
+    expect(workflow).toContain("group: desktop-linux-systemd-probe-${{ github.ref }}");
+    expect(workflow).toContain("cancel-in-progress: true");
+    expect(workflow).toContain("timeout-minutes: 45");
+    expect(workflow).toContain("actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0");
+    expect(workflow).toContain("persist-credentials: false");
+    expect(workflow).toContain("./.github/actions/setup-project-bun");
+    expect(workflow).toContain("bun run build:gui");
+    expect(workflow.indexOf("bun run build:gui"))
+      .toBeLessThan(workflow.indexOf("desktop/scripts/build-runtime.ts"));
+    expect(workflow).toContain("PATH: /usr/bin:/bin");
+    expect(workflow).toContain("OCX_DESTRUCTIVE_SYSTEMD_PROBE: \"1\"");
+    expect(workflow).toContain("OCX_PROBE_RUNTIME_ROOT");
+    expect(workflow).toContain("desktop/scripts/probe-desktop-direct-two-generation.ts");
+    expect(workflow).toContain("/usr/bin/ocx-runtime");
+    expect(workflow).toContain("desktop/scripts/probe-linux-deb-systemd.ts");
+    expect(workflow).toContain("dpkg -i");
+    expect(workflow).toContain("This job does not run dpkg -r");
+    expect(workflow.indexOf("probe-desktop-direct-two-generation.ts"))
+      .toBeLessThan(workflow.indexOf("dpkg -i"));
+    const systemdJob = (Bun.YAML.parse(workflow) as {
+      jobs?: {
+        "linux-deb-systemd"?: {
+          steps?: { name?: string; env?: Record<string, string>; run?: string }[];
+        };
+      };
+    }).jobs?.["linux-deb-systemd"];
+    const steps = systemdJob?.steps ?? [];
+    const dpkgIdx = steps.findIndex(step => step.name === "Install runtime-layout deb");
+    const prepIdx = steps.findIndex(step => step.name === "Prepare systemd probe PATH");
+    const probeIdx = steps.findIndex(step => step.name === "Probe systemd from package-owned runtime");
+    const diagIdx = steps.findIndex(step => step.name === "Bounded failure diagnostics");
+    expect(dpkgIdx).toBeGreaterThan(-1);
+    expect(prepIdx).toBeGreaterThan(dpkgIdx);
+    expect(probeIdx).toBeGreaterThan(prepIdx);
+    expect(diagIdx).toBeGreaterThan(probeIdx);
+    const prep = steps[prepIdx]!.run ?? "";
+    const requiredStart = prep.indexOf("required=(");
+    const requiredEnd = prep.indexOf(")", requiredStart);
+    const required = prep.slice(requiredStart, requiredEnd + 1);
+    expect(required).toContain("sh");
+    expect(required).toContain("systemctl");
+    expect(required).toContain("kill");
+    expect(required).toContain("ps");
+    expect(required).toContain("ss");
+    expect(required).toContain("lsof");
+    expect(required).toContain("cp");
+    expect(required).toContain("cat");
+    expect(required).not.toContain("node");
+    expect(required).not.toContain("bun");
+    expect(required).not.toContain("npm");
+    expect(required).not.toContain("ocx");
+    expect(required).not.toContain("opencodex");
+    expect(prep).toContain('for dir in /usr/bin /bin; do');
+    expect(prep).toContain("readlink -f");
+    expect(prep).toContain("ln -s");
+    expect(prep).toContain("required tool missing");
+    expect(prep).not.toContain("github.event");
+    expect(prep).not.toContain("${{");
+    expect(steps[probeIdx]!.env?.PATH).toBe("${{ runner.temp }}/ocx-systemd-path");
+    expect(steps[probeIdx]!.env?.PATH).not.toContain("/usr/bin");
+    const probeRun = steps[probeIdx]!.run ?? "";
+    expect(probeRun).toContain('allow="${RUNNER_TEMP}/ocx-systemd-path"');
+    expect(probeRun).toContain('export PATH="$allow"');
+    expect(probeRun).toContain("hash -r");
+    expect(probeRun.indexOf("export PATH=")).toBeLessThan(probeRun.indexOf("command -v"));
+    expect(probeRun).toContain("for name in bun node npm ocx opencodex");
+    expect(probeRun).toContain("global JS runtime remained on PATH: ${name} -> ${resolved}");
+    expect(probeRun).toContain("/usr/bin/ocx-runtime");
+    expect(probeRun).not.toContain("command -v bun >/dev/null || command -v node");
+    expect(steps[diagIdx]!.env?.PATH).toBe("/usr/bin:/bin");
+    expect(workflow).not.toContain("app/desktop");
+    expect(workflow).not.toContain("pull_request_target");
+    expect(workflow).not.toContain("secrets.");
+    expect(workflow).not.toContain("always()");
+    expect(workflow).not.toMatch(/uses:\s+\S+@(?:v\d+|main|master)\b/);
+    expect(workflow).not.toContain("macos-latest");
+    expect(workflow).not.toContain("windows-latest");
+  });
+
+  test("desktop reload-generation contract is least-privilege, SHA-pinned, and rust-lib only", async () => {
+    const workflow = await readText(".github/workflows/desktop-reload-generation.yml");
+    const parsed = Bun.YAML.parse(workflow) as {
+      on?: {
+        pull_request?: { paths?: string[]; branches?: string[]; types?: string[] };
+        push?: { paths?: string[]; branches?: string[] };
+        workflow_dispatch?: unknown;
+        pull_request_target?: unknown;
+      };
+      permissions?: Record<string, string>;
+      concurrency?: { group?: string; "cancel-in-progress"?: boolean };
+      jobs?: Record<string, {
+        name?: string;
+        "runs-on"?: string;
+        "timeout-minutes"?: number;
+        permissions?: Record<string, string>;
+        strategy?: { "fail-fast"?: boolean; matrix?: { os?: string[] } };
+        steps?: Array<{
+          name?: string;
+          uses?: string;
+          with?: Record<string, unknown>;
+          if?: string;
+          shell?: string;
+          run?: string;
+        }>;
+      }>;
+    };
+
+    // setup-project-bun resolves Bun from package.json; the lock moves with it.
+    const expectedPaths = [
+      "desktop/**",
+      "package.json",
+      "bun.lock",
+      ".github/workflows/desktop-reload-generation.yml",
+      ".github/actions/setup-project-bun/action.yml",
+    ];
+    expect([...(parsed.on?.pull_request?.paths ?? [])]).toEqual(expectedPaths);
+    expect([...(parsed.on?.push?.paths ?? [])]).toEqual(expectedPaths);
+    expect([...(parsed.on?.push?.branches ?? [])].sort()).toEqual(["dev", "main", "preview"]);
+    expect(parsed.on?.pull_request?.branches).toBeUndefined();
+    expect(parsed.on?.pull_request?.types).toBeUndefined();
+    expect(Object.keys(parsed.on?.pull_request ?? {}).sort()).toEqual(["paths"]);
+    expect(Object.keys(parsed.on ?? {}).sort()).toEqual([
+      "pull_request",
+      "push",
+      "workflow_dispatch",
+    ]);
+    expect(parsed.on?.pull_request_target).toBeUndefined();
+
+    expect(parsed.permissions).toEqual({ contents: "read" });
+    expect(Object.keys(parsed.permissions ?? {})).toEqual(["contents"]);
+    expect(parsed.concurrency).toEqual({
+      group: "desktop-reload-generation-${{ github.ref }}",
+      "cancel-in-progress": true,
+    });
+
+    expect(Object.keys(parsed.jobs ?? {})).toEqual(["rust-lib-contract"]);
+    const job = parsed.jobs?.["rust-lib-contract"];
+    expect(job?.name).toBe("desktop rust lib tests (${{ matrix.os }})");
+    expect(job?.name?.toLowerCase()).not.toContain("physical");
+    expect(job?.permissions).toBeUndefined();
+    expect(job?.["runs-on"]).toBe("${{ matrix.os }}");
+    expect(job?.["timeout-minutes"]).toBe(45);
+    expect(job?.strategy?.["fail-fast"]).toBe(false);
+    expect(job?.strategy?.matrix?.os).toEqual(["ubuntu-latest", "windows-latest"]);
+
+    const steps = job?.steps ?? [];
+    expect(steps[0]?.uses).toBe("actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0");
+    expect(steps[0]?.with).toEqual({ "persist-credentials": false });
+    expect(steps[1]?.uses).toBe("./.github/actions/setup-project-bun");
+
+    const rustup = steps.find(step => step.name === "Select Rust 1.88.0");
+    expect(rustup?.shell).toBe("bash");
+    expect(hasExactShellCommand(
+      rustup?.run,
+      "rustup toolchain install 1.88.0 --profile minimal --no-self-update",
+    )).toBe(true);
+    expect(hasExactShellCommand(rustup?.run, "rustup run 1.88.0 rustc --version")).toBe(true);
+    expect(hasExactShellCommand(rustup?.run, "rustup run 1.88.0 cargo --version")).toBe(true);
+    expect(rustup?.run).not.toContain("curl");
+    expect(rustup?.run).not.toContain("sh.rustup.rs");
+    expect(rustup?.run).not.toMatch(/\bstable\b/);
+
+    const cargo = steps.find(step => step.name === "Desktop Rust lib tests (authoritative)");
+    expect(cargo?.shell).toBe("bash");
+    expect(hasExactShellCommand(
+      cargo?.run,
+      "rustup run 1.88.0 cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --lib",
+    )).toBe(true);
+
+    const bunRegression = steps.find(
+      step => step.name === "Focused reload-generation Bun regression",
+    );
+    expect(bunRegression?.shell).toBe("bash");
+    expect(hasExactShellCommand(
+      bunRegression?.run,
+      "bun test ./desktop/tests/probe-a-reload-generation.test.ts",
+    )).toBe(true);
+
+    const sentinel = steps.find(
+      step => step.name === "Source-sentinel probe (not physical WebView proof)",
+    );
+    expect(sentinel?.shell).toBe("bash");
+    expect(sentinel?.run).toContain("bun desktop/scripts/probe-a-reload-generation.ts");
+    const cargoIdx = steps.findIndex(step => step.name === cargo?.name);
+    const bunIdx = steps.findIndex(step => step.name === bunRegression?.name);
+    const sentinelIdx = steps.findIndex(step => step.name === sentinel?.name);
+    expect(cargoIdx).toBeGreaterThan(-1);
+    expect(bunIdx).toBeGreaterThan(cargoIdx);
+    expect(sentinelIdx).toBeGreaterThan(bunIdx);
+    expect(hasExactShellCommand(
+      sentinel?.run,
+      `echo "$out" | grep -F '"kind":"source-sentinel"'`,
+    )).toBe(true);
+    expect(hasExactShellCommand(
+      sentinel?.run,
+      `echo "$out" | grep -F '"physicalWebviewEvidence":false'`,
+    )).toBe(true);
+    expect(hasExactShellCommand(
+      sentinel?.run,
+      `echo "$out" | grep -F '"windowsWebView2NavigateFinished":false'`,
+    )).toBe(true);
+
+    expect(workflow).not.toContain("pull_request_target");
+    expect(workflow).not.toContain("secrets.");
+    expect(workflow).not.toMatch(/uses:\s+\S+@(?:v\d+|main|master)\b/);
+    expect(workflow.toLowerCase()).not.toContain("physical-webview");
+    expect(Object.keys(parsed.jobs ?? {}).some(name => /physical/i.test(name))).toBe(false);
   });
 
   test("service lifecycle is least-privilege, bounded, and cannot swallow health failures", async () => {

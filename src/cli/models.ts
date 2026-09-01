@@ -181,7 +181,11 @@ async function syncCustomModelsIfLive(): Promise<void> {
     return null;
   });
   if (synced?.status === "skipped") {
-    console.log("Custom model saved; Codex integration is OFF, so its catalog was not changed.");
+    if (synced.skippedReason === "desired_disabled") {
+      console.log("Custom model saved; Codex integration is OFF, so its catalog was not changed.");
+    } else if (synced.skippedReason === "no_config") {
+      console.log("Custom model saved; Codex config is absent, so its catalog was not changed.");
+    }
   }
 }
 

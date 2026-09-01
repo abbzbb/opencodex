@@ -532,6 +532,10 @@ describe("ocx provider add --sync", () => {
       const result = runCli(["provider", "add", "deepseek", "--api-key", "sk-test", "--sync"], { OPENCODEX_HOME: dir });
       expect(result.status).toBe(0);
       expect(result.stdout).toContain("deepseek");
+      expect(result.stdout).not.toContain("Models synced to Codex.");
+      expect(result.stdout).toContain("Apply to Codex: ocx sync");
+      const providerSource = readFileSync(join(repoRoot, "src/cli/provider.ts"), "utf8");
+      expect(providerSource).toContain("syncAppliedCodexConfig(synced)");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

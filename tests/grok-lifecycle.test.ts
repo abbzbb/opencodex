@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { isServiceOwnershipError, ServiceOwnershipError } from "../src/service";
 
 const CLI_SOURCE = readFileSync(join(import.meta.dir, "..", "src", "cli", "index.ts"), "utf8");
+const STOP_TX_SOURCE = readFileSync(join(import.meta.dir, "..", "src", "cli", "stop-transaction.ts"), "utf8");
 const ENSURE_SOURCE = readFileSync(join(import.meta.dir, "..", "src", "cli", "ensure-desired-integrations.ts"), "utf8");
 const DISPATCH_SOURCE = readFileSync(join(import.meta.dir, "..", "src", "cli", "dispatch.ts"), "utf8");
 const SERVICE_SOURCE = readFileSync(join(import.meta.dir, "..", "src", "service.ts"), "utf8");
@@ -89,47 +90,54 @@ describe("Grok fence lifecycle wiring", () => {
     expect(ENSURE_SOURCE.match(/const config = deps\.loadConfig\(\)/g)).toHaveLength(2);
   });
 
-  test("handleStop gates shared teardown on ownership but still reverts system env", () => {
-    const stopFn = sliceFn(CLI_SOURCE, "async function handleStop(", "async function handleUninstall(");
-    const restoreFn = sliceFn(CLI_SOURCE, "async function restoreSharedClientStateAfterStop(", "async function handleStop(");
+  test("handleStop restores shared state only after service stop and stable proxy absence", () => {
+    const stopFn = sliceFn(STOP_TX_SOURCE, "export async function runStopTransaction(", "export const STOP_TRANSACTION_CODES");
+    const restoreFn = sliceFn(STOP_TX_SOURCE, "async function restoreSharedClientStateAfterStop(", "export async function runStopTransaction(");
+    const cliStopFn = sliceFn(CLI_SOURCE, "function renderStopTransactionEvent(", "async function handleUninstall(");
 
-    expect(stopFn).toContain("isServiceOwnershipError(err)");
+    expect(stopFn).toContain("deps.isServiceOwnershipError(err)");
     expect(stopFn).toContain("ownershipBlocked = true");
-    expect(stopFn).toContain("if (!ownershipBlocked)");
-    expect(stopFn).toContain("await restoreSharedClientStateAfterStop()");
-    expect(restoreFn).toContain("restoreNativeCodexAsync()");
+    expect(stopFn).toContain("if (proxyAbsent && !serviceStopFailed)");
+    expect(stopFn).toContain("confirmProxyRemainsAbsent(deps, events, serviceCanRespawn)");
+    expect(stopFn).toContain("serviceCanRespawn = service.canRespawn === true");
+    expect(stopFn).toContain("await restoreSharedClientStateAfterStop(");
+    expect(restoreFn).toContain("deps.restoreNativeCodexAsync()");
     expect(restoreFn).not.toContain("revertSystemEnv()");
-    expect(restoreFn).toContain("stripGrokConfig()");
-    expect(stopFn.indexOf("revertSystemEnv()")).toBeLessThan(stopFn.indexOf("if (!ownershipBlocked)"));
+    expect(restoreFn).toContain("deps.stripGrokConfig()");
+    expect(stopFn.indexOf("if (proxyAbsent && !serviceStopFailed)")).toBeLessThan(stopFn.indexOf("deps.revertSystemEnv()"));
+    expect(cliStopFn).toContain("runStopTransaction(");
   });
 
   test("a refused Grok strip makes ocx stop fail instead of reporting success", () => {
-    const restoreFn = sliceFn(CLI_SOURCE, "async function restoreSharedClientStateAfterStop(", "async function handleStop(");
-    const stopFn = sliceFn(CLI_SOURCE, "async function handleStop(", "async function handleUninstall(");
-    expect(restoreFn).toContain("else if (!grok.ok) { restored = false;");
-    expect(restoreFn).toContain("Grok config restore failed");
-    expect(stopFn).toContain("if (!await restoreSharedClientStateAfterStop()) stopFailed = true");
+    const restoreFn = sliceFn(STOP_TX_SOURCE, "async function restoreSharedClientStateAfterStop(", "export async function runStopTransaction(");
+    const stopFn = sliceFn(STOP_TX_SOURCE, "export async function runStopTransaction(", "export const STOP_TRANSACTION_CODES");
+    const cliStopFn = sliceFn(CLI_SOURCE, "function renderStopTransactionEvent(", "async function handleUninstall(");
+    expect(restoreFn).toContain("if (!grok.ok) restored = false;");
+    expect(cliStopFn).toContain("Grok config restore failed");
+    expect(stopFn).toContain("if (!await restoreSharedClientStateAfterStop(deps, events)) restoreFailed = true");
   });
 
   test("a refused proxy stop reports WHY, not just that it failed", () => {
-    const stopFn = sliceFn(CLI_SOURCE, "async function handleStop(", "async function handleUninstall(");
+    const stopFn = sliceFn(STOP_TX_SOURCE, "export async function runStopTransaction(", "export const STOP_TRANSACTION_CODES");
+    const cliStopFn = sliceFn(CLI_SOURCE, "function renderStopTransactionEvent(", "async function handleUninstall(");
     // stopProxy throws the ownership refusal ("run the stop from that home"). A bare
-    // `catch {}` on these call sites strands the operator on a generic failure line, whose
+    // An unbound catch on these call sites strands the operator on a generic failure line, whose
     // natural next move is a manual kill — the teardown the 409 guard exists to prevent.
-    const bareCatchAfterStopProxy = /await stopProxy\([^)]*\);[\s\S]{0,400}?\}\s*catch\s*\{/;
+    const bareCatchAfterStopProxy = /await deps\.stopProxy\([^)]*\);[\s\S]{0,400}?\}\s*catch\s*\{/;
     expect(stopFn).not.toMatch(bareCatchAfterStopProxy);
 
     // Both proxy-stop call sites (tracked pid, and the orphan-recovery pid) bind the error
     // and echo its message.
-    const detailEchoes = stopFn.match(/const detail = err instanceof Error \? err\.message : String\(err\);/g);
+    const detailEchoes = stopFn.match(/const detail = safeMessage\(err, "Proxy stop failed"\);/g);
     expect(detailEchoes).toHaveLength(2);
-    expect(stopFn.match(/if \(detail\) console\.error\(`   \$\{detail\}`\);/g)).toHaveLength(2);
+    expect(cliStopFn.match(/if \(detail\) console\.error\(`   \$\{detail\}`\);/g)).toHaveLength(1);
 
     // A proxy ownership refusal means a foreign service still owns the running proxy, so the
     // shared teardown must be skipped at both call sites, exactly like the service-manager path.
-    const ownershipRefusals = stopFn.match(/err instanceof ProxyOwnershipRefusedError[\s\S]{0,200}?ownershipBlocked = true;/g);
+    const ownershipRefusals = stopFn.match(/if \(deps\.isProxyOwnershipRefused\(err\)\) \{\s*ownershipBlocked = true;/g);
     expect(ownershipRefusals).toHaveLength(2);
-    expect(stopFn.match(/Skipping shared teardown \(native Codex restore, Grok config\): the foreign proxy is still running\./g)).toHaveLength(2);
+    expect(cliStopFn.match(/Skipping shared teardown \(native Codex restore, Grok config\): the foreign proxy is still running\./g)).toHaveLength(1);
+    expect(cliStopFn).toContain("event.ownershipRefused");
     expect(PROCESS_CONTROL_SOURCE).toContain("throw new ProxyOwnershipRefusedError(");
   });
 
@@ -137,24 +145,25 @@ describe("Grok fence lifecycle wiring", () => {
     const stopFn = sliceFn(CLI_SOURCE, "async function handleStop(", "async function handleUninstall(");
     // process.exit() inside handleStop would strand runTrayProxyRestart's start() half.
     expect(stopFn).toContain("process.exitCode = 1");
-    expect(stopFn).toContain("return !stopFailed");
+    expect(stopFn).toContain("return result.ok");
     expect(stopFn).not.toContain("process.exit(1)");
 
     const restartCase = sliceFn(DISPATCH_SOURCE, "restart: async", "health: async");
     expect(restartCase).toContain("await deps.handleProxyRestart(deps.handleRestartStartWhenStopped)");
-    const trayRestart = sliceFn(CLI_SOURCE, "async function handleTrayProxyRestart(", "async function restoreSharedClientStateAfterStop(");
+    const trayRestart = sliceFn(CLI_SOURCE, "async function handleTrayProxyRestart(", "async function handleStop(");
     const restartHelper = sliceFn(CLI_SOURCE, "async function handleProxyRestart(", "async function handleTrayProxyRestart(");
     expect(trayRestart).toContain("await handleProxyRestart(() => handleTrayProxyStart(false))");
     expect(restartHelper).toContain("requestBoundSystemRestart(previous, deadlineAt)");
   });
 
   test("handleStop treats an incomplete native Codex restore as a stop failure", () => {
-    const restoreFn = sliceFn(CLI_SOURCE, "async function restoreSharedClientStateAfterStop(", "async function handleStop(");
-    const stopFn = sliceFn(CLI_SOURCE, "async function handleStop(", "async function handleUninstall(");
-    expect(restoreFn).toContain("if (result.success) console.log");
+    const restoreFn = sliceFn(STOP_TX_SOURCE, "async function restoreSharedClientStateAfterStop(", "export async function runStopTransaction(");
+    const stopFn = sliceFn(STOP_TX_SOURCE, "export async function runStopTransaction(", "export const STOP_TRANSACTION_CODES");
+    const cliStopFn = sliceFn(CLI_SOURCE, "function renderStopTransactionEvent(", "async function handleUninstall(");
+    expect(restoreFn).toContain("if (result.success)");
     expect(restoreFn).toContain("restored = false");
-    expect(restoreFn).toContain("console.error(`⚠️  ${result.message}`)");
-    expect(stopFn).toContain("if (!await restoreSharedClientStateAfterStop()) stopFailed = true");
+    expect(cliStopFn).toContain("console.error(`⚠️  ${event.message}`)");
+    expect(stopFn).toContain("if (!await restoreSharedClientStateAfterStop(deps, events)) restoreFailed = true");
   });
 
   test("the daemon's exit cleanup keeps the OCX_SERVICE exclusion and adds the ownership check", () => {

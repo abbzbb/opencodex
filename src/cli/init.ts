@@ -1,6 +1,6 @@
 import * as readline from "node:readline";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
-import { injectCodexConfig } from "../codex/inject";
+import { formatCodexInjectOutcome, injectCodexConfig } from "../codex/inject";
 import { classifyOpenAiTierBackup, getConfigPath, getDefaultConfig, isValidProviderName, preserveOpenAiTierRollbackSnapshot, saveConfig } from "../config";
 import { enrichProviderFromCatalog } from "../oauth/key-providers";
 import { deriveInitProviders } from "../providers/derive";
@@ -183,7 +183,7 @@ export async function runInit(): Promise<void> {
     if (injectAnswer.trim().toLowerCase() !== "n") {
       console.log("Fetching available models from provider...");
       const result = await injectCodexConfig(port, config);
-      console.log(result.success ? `✅ ${result.message}` : `⚠️  ${result.message}`);
+      console.log(formatCodexInjectOutcome(result));
     }
 
     const shimAnswer = await prompt.ask("Install Codex autostart shim? [Y/n]: ");

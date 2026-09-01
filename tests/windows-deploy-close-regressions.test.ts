@@ -29,7 +29,7 @@ describe("update-job restart avoids the shell-less .cmd EINVAL (Windows, bun/sou
     expect(src).toContain("refusing to hop");
     expect(src).toContain("runtimeTrusted");
     expect(read("src/cli/index.ts")).toContain("allowEphemeralFallback: !hardPin");
-    expect(read("src/cli/index.ts")).toContain("preferRetryMs: hardPin ? 5_000 : 750");
+    expect(read("src/cli/index.ts")).toContain("preferRetryMs: hardPin ? PINNED_PORT_PREFER_RETRY_MS : 750");
     expect(read("src/cli/dispatch.ts")).toContain("Not opening the GUI");
     expect(read("src/server/ports.ts")).toContain("allowEphemeralFallback");
   });
@@ -71,7 +71,7 @@ describe("systemd detection tolerates a no-DBUS SSH session (F9)", () => {
     expect(src).toMatch(/catch \{ \/\* no user bus in this session \*\/ \}\s*\n\s*return userRuntimeDir\(\) !== null;/);
   });
   test("install ensures the user-bus env before touching systemctl --user", () => {
-    expect(src).toMatch(/function installSystemd\(\): void \{\s*\n\s*ensureUserBusEnv\(\);/);
+    expect(src).toMatch(/function installSystemd\(runtime\?: ServiceRuntimeIdentity\): void \{\s*\n\s*ensureUserBusEnv\(\);/);
   });
 });
 

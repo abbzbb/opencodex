@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -7,6 +7,19 @@ import { fileURLToPath } from "node:url";
 import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS } from "../src/codex/catalog/native-models";
 
 const repoRoot = dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
+
+const canSymlink = (() => {
+  const dir = mkdtempSync(join(tmpdir(), "ocx-catalog-symlink-probe-"));
+  try {
+    symlinkSync(join(dir, "probe-target"), join(dir, "probe-link"));
+    return true;
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "EPERM") return false;
+    throw error;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+})();
 
 function runScript(
   codexHome: string,
@@ -25,6 +38,19 @@ function runScript(
     encoding: "utf8",
   });
   return { stdout: result.stdout?.trim() ?? "", stderr: result.stderr ?? "", status: result.status ?? 1 };
+}
+
+function hideHostCodex(opencodexHome: string): Record<string, string> {
+  const emptyBin = join(opencodexHome, "empty-bin");
+  const home = join(opencodexHome, "probe-home");
+  mkdirSync(emptyBin, { recursive: true });
+  mkdirSync(home, { recursive: true });
+  return {
+    PATH: emptyBin,
+    HOME: home,
+    USERPROFILE: home,
+    CODEX_CLI_PATH: "",
+  };
 }
 
 function createCodexCatalogFixture(dir: string): string {
@@ -1262,5 +1288,91 @@ describe("Codex catalog sync hardening", () => {
     `);
     expect(r.status).toBe(0);
     expect(r.stdout).toBe(resolve(realpathSync.native(alternateHome), "nested/catalog.json"));
+  });
+
+  test("an empty Codex home with no Codex CLI skips catalog writes as no_source", () => {
+    const r = runScript(codexHome, opencodexHome, `
+      const { syncCatalogModels } = require("./src/codex/catalog");
+      syncCatalogModels({ providers: {} }).then(res => console.log(JSON.stringify(res)));
+    `, hideHostCodex(opencodexHome));
+    expect(r.status).toBe(0);
+    const result = JSON.parse(r.stdout) as {
+      added: number;
+      catalogWritten: boolean;
+      skippedReason?: string;
+    };
+    expect(result).toMatchObject({
+      added: 0,
+      catalogWritten: false,
+      skippedReason: "no_source",
+    });
+    expect(existsSync(join(codexHome, "opencodex-catalog.json"))).toBe(false);
+  });
+
+  test("a malformed on-disk catalog without Codex CLI is unreadable_source, not no_source", () => {
+    writeFileSync(join(codexHome, "opencodex-catalog.json"), "{not-json", "utf8");
+    const r = runScript(codexHome, opencodexHome, `
+      const { syncCatalogModels } = require("./src/codex/catalog");
+      syncCatalogModels({ providers: {} }).then(res => console.log(JSON.stringify(res)));
+    `, hideHostCodex(opencodexHome));
+    expect(r.status).toBe(0);
+    const result = JSON.parse(r.stdout) as {
+      added: number;
+      catalogWritten: boolean;
+      skippedReason?: string;
+    };
+    expect(result).toMatchObject({
+      added: 0,
+      catalogWritten: false,
+      skippedReason: "unreadable_source",
+    });
+    expect(readFileSync(join(codexHome, "opencodex-catalog.json"), "utf8")).toBe("{not-json");
+  });
+
+  test("a directory at the catalog path is unreadable_source, not no_source", () => {
+    mkdirSync(join(codexHome, "opencodex-catalog.json"));
+    const r = runScript(codexHome, opencodexHome, `
+      const { syncCatalogModels } = require("./src/codex/catalog");
+      syncCatalogModels({ providers: {} }).then(res => console.log(JSON.stringify(res)));
+    `, hideHostCodex(opencodexHome));
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout)).toMatchObject({
+      added: 0,
+      catalogWritten: false,
+      skippedReason: "unreadable_source",
+    });
+  });
+
+  test.skipIf(!canSymlink)("a valid catalog symlink is a usable source and keeps the link", () => {
+    const target = join(codexHome, "real-catalog.json");
+    const link = join(codexHome, "opencodex-catalog.json");
+    writeFileSync(target, JSON.stringify({ models: [nativeEntry("gpt-5.5", 0)] }, null, 2) + "\n", "utf8");
+    symlinkSync(target, link);
+    const r = runScript(codexHome, opencodexHome, `
+      const { syncCatalogModels } = require("./src/codex/catalog");
+      syncCatalogModels({ providers: {} }).then(res => console.log(JSON.stringify(res)));
+    `, hideHostCodex(opencodexHome));
+    expect(r.status).toBe(0);
+    const result = JSON.parse(r.stdout) as { skippedReason?: string; catalogWritten: boolean };
+    expect(result.skippedReason).toBeUndefined();
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(readFileSync(target, "utf8")).toContain("gpt-5.5");
+  });
+
+  test.skipIf(!canSymlink)("a dangling catalog symlink is unreadable_source and is not replaced", () => {
+    const link = join(codexHome, "opencodex-catalog.json");
+    symlinkSync(join(codexHome, "missing-catalog.json"), link);
+    const r = runScript(codexHome, opencodexHome, `
+      const { syncCatalogModels } = require("./src/codex/catalog");
+      syncCatalogModels({ providers: {} }).then(res => console.log(JSON.stringify(res)));
+    `, hideHostCodex(opencodexHome));
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout)).toMatchObject({
+      added: 0,
+      catalogWritten: false,
+      skippedReason: "unreadable_source",
+    });
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(existsSync(join(codexHome, "missing-catalog.json"))).toBe(false);
   });
 });

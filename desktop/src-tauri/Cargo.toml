@@ -1,0 +1,28 @@
+[package]
+name = "opencodex-desktop"
+version = "2.36.0"
+description = "OpenCodex Desktop App shell"
+authors = ["opencodex contributors"]
+license = "MIT"
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "opencodex_desktop_lib"
+crate-type = ["lib"]
+
+[[bin]]
+name = "opencodex-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "=2.11.5", features = ["tray-icon", "image-png"] }
+tauri-plugin-opener = "=2.5.4"
+tauri-plugin-single-instance = "=2.4.3"
+url = "2"
+uuid = { version = "1", features = ["v4"] }

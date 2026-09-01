@@ -1,0 +1,3 @@
+# Target-triple sidecar binaries are produced at build or packaging time.
+*
+!.gitignore

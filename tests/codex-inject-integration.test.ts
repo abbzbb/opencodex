@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach, setDefaultTimeout } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -12,6 +12,19 @@ import {
 import { SPAWN_BUDGET_MS } from "./helpers/test-budget";
 
 const repoRoot = dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
+
+const canSymlink = (() => {
+  const dir = mkdtempSync(join(tmpdir(), "ocx-inject-symlink-probe-"));
+  try {
+    symlinkSync(join(dir, "probe-target"), join(dir, "probe-link"));
+    return true;
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "EPERM") return false;
+    throw error;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+})();
 
 setDefaultTimeout(SPAWN_BUDGET_MS);
 
@@ -701,5 +714,56 @@ describe("injectCodexConfig integration (Design B)", () => {
     expect(config).not.toContain("[features.multi_agent_v2]");
     expect(config).not.toContain("multi_agent_v2 = true");
     expect(config).not.toContain("multi_agent_v2 = {");
+  });
+
+  test("a missing config.toml is a skipped no_config no-op and does not create the file", () => {
+    const r = runInject(codexHome, ocxHome);
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout)).toMatchObject({
+      success: true,
+      status: "skipped",
+      skippedReason: "no_config",
+    });
+    expect(existsSync(join(codexHome, "config.toml"))).toBe(false);
+  });
+
+  test("a directory at config.toml is unreadable, not no_config", () => {
+    mkdirSync(join(codexHome, "config.toml"));
+    const r = runInject(codexHome, ocxHome);
+    expect(r.status).toBe(0);
+    const result = JSON.parse(r.stdout) as { success: boolean; status?: string; skippedReason?: string; message: string };
+    expect(result.success).toBe(false);
+    expect(result.status).toBeUndefined();
+    expect(result.skippedReason).toBeUndefined();
+    expect(result.message).toContain("not a usable regular file");
+    expect(result.message).toContain("directory");
+  });
+
+  test.skipIf(!canSymlink)("a valid config.toml symlink is injected through the target without replacing the link", () => {
+    const target = join(codexHome, "real.toml");
+    writeFileSync(target, 'model = "gpt-5.5"\n', "utf8");
+    symlinkSync(target, join(codexHome, "config.toml"));
+    const r = runInject(codexHome, ocxHome);
+    expect(r.status).toBe(0);
+    const result = JSON.parse(r.stdout) as { success: boolean; status?: string; skippedReason?: string };
+    expect(result.success).toBe(true);
+    expect(result.status).not.toBe("skipped");
+    expect(result.skippedReason).toBeUndefined();
+    expect(lstatSync(join(codexHome, "config.toml")).isSymbolicLink()).toBe(true);
+    expect(readFileSync(target, "utf8")).toContain("openai_base_url");
+  });
+
+  test.skipIf(!canSymlink)("a dangling config.toml symlink is unreadable and is not mutated", () => {
+    const link = join(codexHome, "config.toml");
+    symlinkSync(join(codexHome, "missing.toml"), link);
+    const r = runInject(codexHome, ocxHome);
+    expect(r.status).toBe(0);
+    const result = JSON.parse(r.stdout) as { success: boolean; status?: string; skippedReason?: string; message: string };
+    expect(result.success).toBe(false);
+    expect(result.status).toBeUndefined();
+    expect(result.skippedReason).toBeUndefined();
+    expect(result.message).toContain("dangling-symlink");
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(existsSync(join(codexHome, "missing.toml"))).toBe(false);
   });
 });

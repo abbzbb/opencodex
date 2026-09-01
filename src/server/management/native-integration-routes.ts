@@ -329,27 +329,34 @@ async function handleCodexToggle(ctx: ManagementContext): Promise<Response> {
       // same trap `runGrokApplyFlight` documents below.
       const runtime = (ctx.deps.readRuntimePort ?? readRuntimePort)(process.pid);
       const port = runtime?.port ?? ctx.config.port;
-      const { syncModelsToCodex } = await import("../../codex/sync");
+      const { syncAppliedCodexConfig, syncModelsToCodex } = await import("../../codex/sync");
       const applied = await syncModelsToCodex(port);
-      if (applied.status === "skipped") {
+      if (!syncAppliedCodexConfig(applied)) {
+        if (applied.status === "skipped") {
+          return jsonResponse({
+            ok: true, clientId: "codex", changed: durable && persisted.status === "committed",
+            state: "absent",
+            desiredEnabled: enabled,
+            message: applied.skippedReason === "no_config"
+              ? applied.message
+              : "Codex integration is OFF; enable did not change Codex.",
+            reason: "apply_incomplete",
+          } satisfies NativeToggleEnvelope);
+        }
         return jsonResponse({
           ok: true, clientId: "codex", changed: durable && persisted.status === "committed",
           state: "absent",
           desiredEnabled: enabled,
-          message: "Codex integration is OFF; enable did not change Codex.",
+          message: `Codex intent saved, but applying it did not complete: ${applied.message}`,
           reason: "apply_incomplete",
         } satisfies NativeToggleEnvelope);
       }
       return jsonResponse({
         ok: true, clientId: "codex", changed: durable && persisted.status === "committed",
-        state: applied.ok ? "current" : "absent",
+        state: "current",
         desiredEnabled: enabled,
-        message: applied.ok
-          ? "Codex now routes through opencodex"
-          : `Codex intent saved, but applying it did not complete: ${applied.message}`,
-        ...(applied.ok
-          ? (durable ? {} : { reason: "not_durable" })
-          : { reason: "apply_incomplete" }),
+        message: "Codex now routes through opencodex",
+        ...(durable ? {} : { reason: "not_durable" }),
       } satisfies NativeToggleEnvelope);
     }
 

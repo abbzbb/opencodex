@@ -16,7 +16,7 @@ import { providerConfigSeed } from "../providers/derive";
 import { dropProviderCustomModels } from "../providers/provider-id-rewrite";
 import type { OcxProviderConfig } from "../types";
 import { findLiveProxy } from "../server/proxy-liveness";
-import { syncModelsToCodex } from "../codex/sync";
+import { syncAppliedCodexConfig, syncModelsToCodex } from "../codex/sync";
 import { codexAccountNamespaceProviderCollisionError } from "../codex/account-namespace-match";
 
 // ---------------------------------------------------------------------------
@@ -241,14 +241,20 @@ async function handleAdd(args: string[]): Promise<void> {
   let codexSyncSkipped = false;
   if (wantsSync) {
     const live = await findLiveProxy();
-    if (live) {
+    if (!live) {
+      codexSyncSkipped = true;
+    } else {
       const synced = await syncModelsToCodex(live.port).catch(e => {
         console.error(`Warning: sync failed: ${e instanceof Error ? e.message : String(e)}`);
         return null;
       });
-      if (synced?.status === "skipped") {
+      if (!syncAppliedCodexConfig(synced)) {
         codexSyncSkipped = true;
-        console.log("Provider saved; Codex integration is OFF, so Codex sync was skipped.");
+        if (synced?.status === "skipped" && synced.skippedReason === "desired_disabled") {
+          console.log("Provider saved; Codex integration is OFF, so Codex sync was skipped.");
+        } else if (synced?.status === "skipped" && synced.skippedReason === "no_config") {
+          console.log(`Provider saved; ${synced.message}`);
+        }
       }
     }
   }

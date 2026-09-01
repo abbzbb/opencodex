@@ -16,7 +16,7 @@ import type { LiveProxy } from "../server/proxy-liveness";
 import type { OcxConfig } from "../types";
 import { hasHelpFlag, printSubcommandUsage, printUsage } from "./help";
 import { setIntegrationEnabled, shouldSyncCodexOnStart } from "../codex/desired-state";
-import { syncModelsToCodex } from "../codex/sync";
+import { syncAppliedCodexConfig, syncModelsToCodex } from "../codex/sync";
 import { collectOrcaCodexHomeDiagnostic } from "../codex/home";
 import { restoreNativeCodexAsync } from "../codex/inject";
 import { stripGrokConfig } from "../grok/inject";
@@ -95,9 +95,12 @@ const commandRunners: Record<string, CommandRunner> = {
       }
       const synced = await syncModelsToCodex(live.port);
       if (synced.status === "skipped") {
+        if (synced.skippedReason === "no_config") {
+          return emitBack(false, synced.message, 1);
+        }
         return emitBack(false, "Codex integration is OFF; restore back did not change Codex. Retry after the competing integration change finishes.", 2);
       }
-      if (!synced.ok) {
+      if (!syncAppliedCodexConfig(synced)) {
         return emitBack(false, "Plain `codex` was not switched back to opencodex. Fix the reported Codex config issue and retry.", 1);
       }
       const target = collectOrcaCodexHomeDiagnostic();
@@ -296,7 +299,11 @@ const commandRunners: Record<string, CommandRunner> = {
     );
     let code = 0;
     if (synced.status === "skipped") {
-      console.log("Codex integration is OFF; sync skipped and no Codex files changed.");
+      console.log(
+        synced.skippedReason === "no_config"
+          ? synced.message
+          : "Codex integration is OFF; sync skipped and no Codex files changed.",
+      );
     } else if (synced.status === "catalog-only") {
       // Explicit sync with the integration OFF still refreshes the catalog/cache
       // for side profiles that consume the proxy without injection.

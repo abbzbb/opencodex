@@ -51,16 +51,16 @@ describe("snapshot-guarded stale-state purge", () => {
   });
 
   test("handleStop snapshots stale state before probing and purges through the guards", () => {
-    const cliSource = readFileSync(join(import.meta.dir, "..", "src", "cli", "index.ts"), "utf8");
-    const stopFn = cliSource.slice(cliSource.indexOf("async function handleStop()"), cliSource.indexOf("async function handleUninstall()"));
+    const txSource = readFileSync(join(import.meta.dir, "..", "src", "cli", "stop-transaction.ts"), "utf8");
+    const stopFn = txSource.slice(txSource.indexOf("export async function runStopTransaction("), txSource.indexOf("export const STOP_TRANSACTION_CODES"));
 
-    const snapshotAt = stopFn.indexOf("const stalePidValue = readPidFileValue()");
-    const probeAt = stopFn.indexOf("await findLiveProxy()");
+    const snapshotAt = stopFn.indexOf("const stalePidValue = deps.readPidFileValue()");
+    const probeAt = stopFn.indexOf("await deps.findLiveProxy()");
     expect(snapshotAt).toBeGreaterThan(-1);
     expect(probeAt).toBeGreaterThan(-1);
     expect(snapshotAt).toBeLessThan(probeAt);
-    expect(stopFn).toContain("removePidIfValueIs(stalePidValue)");
-    expect(stopFn).toContain("removeRuntimePortIfPidIs(staleRuntimePid)");
+    expect(stopFn).toContain("deps.removePidIfValueIs(stalePidValue)");
+    expect(stopFn).toContain("deps.removeRuntimePortIfPidIs(staleRuntimePid)");
     expect(stopFn).not.toContain("removePid();");
     expect(stopFn).not.toContain("removeRuntimePort();");
   });

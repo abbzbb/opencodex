@@ -1,9 +1,13 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, statSync } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { expandUserPath, loadConfig, readConfigDiagnostics, websocketsEnabled } from "../../config";
 import { shouldSyncCodexOnStart } from "../desired-state";
+import {
+  classifyRegularFilePresence,
+  type RegularFilePresenceIo,
+} from "../regular-file-presence";
 import { legacyCustomModelCatalogSlugs } from "../custom-model-catalog-migration";
 import { CODEX_CONFIG_PATH, CODEX_MODELS_CACHE_PATH, DEFAULT_CATALOG_PATH, getCodexHome, readRootTomlString, resolveCodexConfigPath } from "../paths";
 import { clearModelCache, DEFAULT_MODEL_CACHE_TTL_MS, getFreshCached, getStaleCached, isModelsFetchCoolingDown, markModelsFetchFailure, setCached } from "../model-cache";
@@ -41,7 +45,7 @@ import {
 } from "../model-entitlements";
 
 
-import { CODEX_CUSTOM_MODEL_CATALOG_KIND, CODEX_PROVIDER_MODEL_CATALOG_KIND, activeCodexModelsCachePath, applyCatalogMetadata, applyMultiAgentMode, applyNativeOpenAiContextOverride, applyRoutedCodexToolMode, catalogBackupPathFor, catalogHasRoutedEntries, catalogModelSlug, ensureStrictCatalogFields, findNativeTemplate, findSupportedNativeTemplate, isDefaultCatalogPath, isRoutedModelCompatibilityExcluded, legacyCatalogBackupPath, normalizeRoutedCatalogEntry, normalizeServiceTiers, readCatalog, readCatalogBackup, readCodexCatalogPath, readCodexCatalogPathForHome, readConfiguredAutoReviewModel, readNativeBaseline } from "./parsing";
+import { CODEX_CUSTOM_MODEL_CATALOG_KIND, CODEX_PROVIDER_MODEL_CATALOG_KIND, activeCodexModelsCachePath, applyCatalogMetadata, applyMultiAgentMode, applyNativeOpenAiContextOverride, applyRoutedCodexToolMode, catalogBackupPathFor, catalogHasRoutedEntries, catalogModelSlug, ensureStrictCatalogFields, findNativeTemplate, findSupportedNativeTemplate, isDefaultCatalogPath, isRoutedModelCompatibilityExcluded, legacyCatalogBackupPath, normalizeRoutedCatalogEntry, normalizeServiceTiers, parseCatalogJson, readCatalog, readCatalogBackup, readCodexCatalogPath, readCodexCatalogPathForHome, readConfiguredAutoReviewModel, readNativeBaseline } from "./parsing";
 import type { CatalogModel, MultiAgentMode, RawCatalog, RawEntry } from "./parsing";
 import { accountBoundNativeOpenAiSlugs, accountBoundNativeOpenAiSlugsBySelector, applyNativeVisibility, CODEX_NATIVE_ALIAS_CATALOG_KIND, desktopAllowlistSuppressedNativeSlugs, disabledNativeSlugs, isNativeAliasCatalogEntry, isUnsupportedOpenAiNativeSlug, NATIVE_OPENAI_MODELS, nativeContextLimits, observedAccountBoundNativeEntries, shouldIncludeAccountBoundNativeOpenAi, shouldIncludeNativeOpenAi, shouldUpgradeToUpstreamEntry, SUPPORTED_NATIVE_OPENAI_SLUGS, upstreamNativeEntry, type NativeContextLimitsInput } from "./metadata";
 import {
@@ -1221,8 +1225,8 @@ interface RetainedCatalogSyncResult {
   path: string;
   catalogWritten: boolean;
   comboOmissions: ComboCatalogOmission[];
-  /** `desired_disabled` observed under K after the provider await; nothing was written. */
-  skippedReason?: "desired_disabled";
+  /** Why no catalog write was attempted. Commit-time aborts remain unclassified. */
+  skippedReason?: "desired_disabled" | "no_source" | "unreadable_source";
 }
 
 /**
@@ -1271,6 +1275,47 @@ function loadCatalogForRetainedSync(path: string): RawCatalog | null {
     ?? (isDefaultCatalogPath(path) ? readCatalog(legacyCatalogBackupPath()) : null)
     ?? readCatalog(activeCodexModelsCachePath())
     ?? active;
+}
+
+const DEFAULT_CATALOG_SOURCE_IO: CatalogSourcePresenceIo = { lstatSync, statSync, readFileSync };
+
+export interface CatalogSourcePresenceIo extends RegularFilePresenceIo {
+  readFileSync: (path: string, encoding: "utf-8") => string;
+}
+
+function inspectCatalogCandidate(
+  path: string,
+  io: CatalogSourcePresenceIo = DEFAULT_CATALOG_SOURCE_IO,
+): "absent" | "readable" | "unreadable" {
+  const presence = classifyRegularFilePresence(path, io);
+  if (presence.kind === "absent") return "absent";
+  if (presence.kind === "unreadable") return "unreadable";
+  try {
+    return parseCatalogJson(io.readFileSync(path, "utf-8")) ? "readable" : "unreadable";
+  } catch {
+    return "unreadable";
+  }
+}
+
+export function classifyOnDiskCatalogSources(
+  catalogPath: string,
+  io: CatalogSourcePresenceIo = DEFAULT_CATALOG_SOURCE_IO,
+): "absent" | "unreadable" | "readable" {
+  const candidates = [
+    catalogPath,
+    catalogBackupPathFor(catalogPath),
+    ...(isDefaultCatalogPath(catalogPath) ? [legacyCatalogBackupPath()] : []),
+    activeCodexModelsCachePath(),
+  ];
+  let unreadable = false;
+  let readable = false;
+  for (const candidate of candidates) {
+    const kind = inspectCatalogCandidate(candidate, io);
+    if (kind === "readable") readable = true;
+    if (kind === "unreadable") unreadable = true;
+  }
+  if (readable) return "readable";
+  return unreadable ? "unreadable" : "absent";
 }
 
 function retainedCatalogSyncEvidence(
@@ -1808,11 +1853,15 @@ export async function syncCatalogModels(
   const owningCodexHome = getCodexHome();
   const preflightRead = readRetainedCatalogSync(config);
   if (preflightRead === null) {
+    const path = readCodexCatalogPath();
     return {
       added: 0,
-      path: readCodexCatalogPath(),
+      path,
       catalogWritten: false,
       comboOmissions: [],
+      skippedReason: classifyOnDiskCatalogSources(path) === "absent"
+        ? "no_source" as const
+        : "unreadable_source" as const,
     };
   }
 

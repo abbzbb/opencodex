@@ -13,6 +13,7 @@
 | `src/config/paths.ts` | Resolves `OPENCODEX_HOME`, `config.json`, and owner-only directory hardening. |
 | `src/config/atomic-write.ts` | Shared synchronous/asynchronous temp-harden-rename writer and residual-temp failure contract. |
 | `src/config/process-state.ts` | Owns `ocx.pid`, `runtime-port.json`, cheap liveness, full command-line identity verification, and snapshot-guarded cleanup. |
+| `src/config/start-lock.ts` | Owner-only cross-process start transaction lock at `$OPENCODEX_HOME/ocx.start.lock`. Token-named owner record, incomplete-publication grace, live-PID protection, compare-before-release, bounded wait, and compare-before-reclaim. `handleStart` acquires it through `withStartLock`; parent `ensure` / Desktop bridge waiters must not. |
 | `src/router.ts` | Provider/model selection before adapter dispatch. |
 | `src/types.ts` | Shared config, parsed request, adapter, and event types. |
 | `src/reasoning-effort.ts` | Codex reasoning-level definitions (`low`/`medium`/`high`/`xhigh`), per-model effort mapping, and catalog effort sanitization. |
@@ -49,7 +50,8 @@ their own files.
 
 `ocx start` refuses a duplicate PID, starts the proxy, writes `~/.opencodex/ocx.pid` and
 `runtime-port.json` through `src/config/process-state.ts`, syncs Codex config/catalog, then serves
-until shutdown. Normal shutdown restores native Codex. Service mode sets
+until shutdown. The actual start child serializes that bind-and-publish window with
+`src/config/start-lock.ts` (see below). Normal shutdown restores native Codex. Service mode sets
 `OCX_SERVICE=1`, so managed restarts do not repeatedly restore/reinject; explicit service stop and
 uninstall still restore.
 
@@ -59,6 +61,36 @@ fixed-path command-line check required before stop, kill, port reclaim, or stale
 Callers must not replace the latter with the former merely to avoid the Windows WMIC/PowerShell
 probe. Expected-PID and snapshot removal helpers are the TOCTOU boundary when a replacement proxy
 can write new state during a probe.
+
+`src/config/start-lock.ts` serializes a start transaction across CLI, service, and Desktop children
+that share one `OPENCODEX_HOME`. The holder is the actual `handleStart` child: it acquires the lock
+through `withStartLock`, re-discovers any live winner, and keeps the lock until PID/runtime (and
+optional later desktop owner) records are published. Parent `ensure` and Desktop bridge processes
+must not hold this lock while waiting on that child. Acquisition uses atomic `mkdir` of
+`ocx.start.lock` plus exclusive `open` of a `${token}.json` owner record. Reclaim unlinks only the
+observed token-named owner path, and only when that owner PID is dead and the token, lock-directory
+identity, and owner fingerprint still match. Release is the same compare-before-unlink. The lock
+never recursively deletes. `withStartLock` releases on every completion path; `handleStart` must not
+call `process.exit` while the lock is held, because Node/Bun terminate without running `finally`.
+
+The directory can be observed during the short `mkdir` to owner-record publication window. An empty
+directory or a single incomplete token record is therefore not stale on sight. Contenders leave it
+untouched for `START_LOCK_INCOMPLETE_GRACE_MS`; after that grace they reclaim only a regular,
+non-symlink shape whose directory and optional owner-file identities remain unchanged across two
+comparisons. This recovers a publisher killed mid-write without letting an immediate waiter remove a
+live publisher's directory.
+
+The default waiter budget is `PINNED_PORT_RECLAIM_TIMEOUT_MS` (60s hard-pin ghost-LISTEN reclaim)
+plus prefer-retry, one bind retry, and publication slack. A shorter wait would time out while a
+legitimate `--port` start still held the lock in reclaim.
+
+[Decision Log]
+- 목적과 의도: Serialize concurrent `ocx start` / ensure / service / Desktop children on one `OPENCODEX_HOME` so only one process binds and publishes PID/runtime records.
+- 기존 구현 및 제약 조건: The lock leaf already existed unused. `handleStart` used `process.exit` on port-busy paths. Pinned `--port` reclaim can hold the start child for 60 seconds. Parent `ensure` and the Desktop bridge wait on a spawned start child.
+- 검토한 주요 대안: Hold the lock in `ensure`/bridge while waiting; keep the 30s waiter budget; leave `process.exit` inside the bind path; acquire before the interactive update prompt.
+- 선택한 방식: A paths-only token lock under `OPENCODEX_HOME`; `handleStart` calls `withStartLock` after the update prompt. The callback rediscovers any live winner, binds, writes PID/runtime records, and rolls back an unpublished listener on failure. `process.exit` runs only after release. Waiters use a budget that outlasts 60s reclaim plus bind/publish slack. Incomplete publication has a separate grace and identity-checked, non-recursive recovery. `ensure` and the Desktop bridge still do not acquire the lock.
+- 다른 대안 대신 이 방식을 선택한 이유: A parent that held the lock while waiting on its child would deadlock. `process.exit` inside the callback would skip `finally` and leave a live-PID lock. A 30s wait would fail while a legitimate pinned-port start was still reclaiming. The update prompt is interactive and must not occupy the mutex.
+- 장점, 단점 및 영향: Concurrent starts serialize; a loser rediscovers the winner and returns existing/duplicate instead of hopping to an ephemeral port. Optional desktop-direct owner publication is not in this change and must later happen before release if that seam lands.
 
 [Decision Log]
 - 목적과 의도: Separate proxy process ownership from persisted configuration without changing lifecycle behavior.

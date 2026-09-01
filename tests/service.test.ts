@@ -193,6 +193,46 @@ describe("systemd service unit", () => {
     expect(unit).not.toContain("StandardError=");
   });
 
+  test("systemd ExecStart resets PATH after login shell init and before token cat", () => {
+    const previousPath = process.env.PATH;
+    const baked = "/tmp/ocx-restricted-path";
+    try {
+      process.env.PATH = baked;
+      const unit = buildUnit();
+      const execLine = unit.split("\n").find(line => line.startsWith("ExecStart=")) ?? "";
+      expect(execLine).toContain('ExecStart="/bin/sh" -lc ');
+      const afterLc = execLine.slice(execLine.indexOf(" -lc "));
+      const pathAssign = afterLc.indexOf("PATH='/tmp/ocx-restricted-path'");
+      const pathExport = afterLc.indexOf("export PATH;");
+      const cat = afterLc.indexOf("$(cat ");
+      const exec = afterLc.indexOf(" exec ");
+      expect(pathAssign).toBeGreaterThan(0);
+      expect(pathExport).toBeGreaterThan(pathAssign);
+      expect(cat).toBeGreaterThan(pathExport);
+      expect(exec).toBeGreaterThan(cat);
+      expect(unit).toContain('Environment="PATH=/tmp/ocx-restricted-path"');
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  });
+
+  test("systemd ExecStart shell-quotes the baked PATH reset", () => {
+    const previousPath = process.env.PATH;
+    const baked = "/tmp/ocx restricted$path";
+    try {
+      process.env.PATH = baked;
+      const unit = buildUnit();
+      const execLine = unit.split("\n").find(line => line.startsWith("ExecStart=")) ?? "";
+      const afterLc = execLine.slice(execLine.indexOf(" -lc "));
+      expect(afterLc).toContain("PATH='/tmp/ocx restricted$path'");
+      expect(afterLc.indexOf("PATH='/tmp/ocx restricted$path'")).toBeLessThan(afterLc.indexOf("$(cat "));
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  });
+
   test("bakes outbound proxy env into the unit so the service is not cut off from upstream (#2107)", () => {
     // systemd does not inherit the installing shell's environment, and ExecStart runs
     // /bin/sh -lc — which is dash on Ubuntu/WSL and reads .profile, not .bashrc. A user
@@ -287,7 +327,7 @@ describe("systemd service unit", () => {
 
   test("service start checks for the systemd user unit before shelling out", async () => {
     const service = await readText("src/service.ts");
-    const installSystemd = service.slice(service.indexOf("function installSystemd()"), service.indexOf("function startSystemd()"));
+    const installSystemd = service.slice(service.indexOf("function installSystemd("), service.indexOf("function startSystemd("));
     const startSystemd = service.slice(service.indexOf("function startSystemd()"), service.indexOf("function stopSystemd()"));
 
     const unitCheckAt = startSystemd.indexOf("existsSync(unitPath())");
@@ -300,7 +340,7 @@ describe("systemd service unit", () => {
 
     // The write goes through writeServiceDefinitionFile so the unit lands 0600: it can carry a
     // proxy credential (#2107). What this test pins is the ORDER — write, then reload.
-    const writeAt = installSystemd.indexOf('writeServiceDefinitionFile(unitPath(), buildUnit(), "utf8")');
+    const writeAt = installSystemd.indexOf('writeServiceDefinitionFile(unitPath(), buildUnit(resolvedProxyEnv(), runtime), "utf8")');
     const reloadAt = installSystemd.indexOf("systemctl --user daemon-reload");
     const enableAt = installSystemd.indexOf("systemctl --user enable");
     const restartAt = installSystemd.indexOf("systemctl --user restart");
@@ -1599,13 +1639,13 @@ describe("service lifecycle cleanup ordering", () => {
   test("Windows service install ends the running task before rewriting its assets, with write retry", async () => {
     const service = await readText("src/service.ts");
     const assetsHelper = service.slice(
-      service.indexOf("function writeWindowsSchedulerAssets()"),
-      service.indexOf("function installWindows()"),
+      service.indexOf("function writeWindowsSchedulerAssets("),
+      service.indexOf("function installWindows("),
     );
-    const installWindows = service.slice(service.indexOf("function installWindows()"), service.indexOf("async function installWindowsNative()"));
+    const installWindows = service.slice(service.indexOf("function installWindows("), service.indexOf("async function installWindowsNative("));
 
     const stopAt = installWindows.indexOf("stopWindows();");
-    const assetsAt = installWindows.indexOf("writeWindowsSchedulerAssets();");
+    const assetsAt = installWindows.indexOf("writeWindowsSchedulerAssets(runtime)");
     const createAt = installWindows.indexOf("buildWindowsSchtasksCreateArgs");
     expect(stopAt).toBeGreaterThan(-1);
     expect(assetsAt).toBeGreaterThan(-1);

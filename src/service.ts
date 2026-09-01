@@ -7,9 +7,9 @@
  */
 import { execFileSync, execSync, spawnSync } from "node:child_process";
 import { findLiveProxy, proxyIdentityAt, SERVICE_STOP_LIVENESS } from "./server/proxy-liveness";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, posix, resolve, win32 } from "node:path";
+import { dirname, isAbsolute, join, posix, resolve, win32 } from "node:path";
 import { expandUserPath, getConfigDir, loadConfig } from "./config";
 import { readPid, removePid, removeRuntimePort, verifyPidIdentity } from "./config/process-state";
 import { restoreNativeCodex, restoreNativeCodexAsync } from "./codex/inject";
@@ -38,7 +38,7 @@ import {
   type ElevatedSchtasksCreateAndRunExecution,
   type ElevatedSchtasksCreateAndRunResult,
 } from "./lib/windows-elevation";
-import { defaultWinswEntry, installWinswService, startWinswService, stopWinswService, statusWinswRaw, uninstallWinswService, winswStatusSummary, winswXmlPath, WINSW_SERVICE_ID, WINSW_SHA256, WINSW_VERSION, type WinswStatus } from "./lib/winsw";
+import { defaultWinswEntry, installWinswService, startWinswService, stopWinswService, statusWinswRaw, uninstallWinswService, winswStatusSummary, winswXmlPath, WINSW_SERVICE_ID, WINSW_SHA256, WINSW_VERSION, type WinswEntry, type WinswStatus } from "./lib/winsw";
 import {
   forgetEphemeralSecretDir,
   forgetEphemeralSecretPath,
@@ -56,15 +56,56 @@ const TASK = "opencodex-proxy";
 
 export type ServiceBackend = "scheduler" | "native";
 
-function cliEntry(): { bun: string; bunRuntimeSource: BunRuntimeSource; cli: string } {
+export type ServiceRuntimeIdentity = {
+  bunPath: string;
+  cliPath: string;
+};
+
+function isAbsoluteRegularFile(path: string): boolean {
+  if (typeof path !== "string" || path.length === 0 || !isAbsolute(path)) return false;
+  try {
+    const stat = lstatSync(path);
+    return stat.isFile() && !stat.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+export function validateServiceRuntimeIdentity(identity: ServiceRuntimeIdentity): ServiceRuntimeIdentity {
+  if (!isAbsoluteRegularFile(identity.bunPath) || !isAbsoluteRegularFile(identity.cliPath)) {
+    throw new Error("service runtime identity paths must be absolute regular files");
+  }
+  return { bunPath: resolve(identity.bunPath), cliPath: resolve(identity.cliPath) };
+}
+
+function provenanceForRuntimePath(bunPath: string): BunRuntimeSource {
+  const durable = durableBunRuntime();
+  if (normalizePathForCompare(bunPath) === normalizePathForCompare(durable.path)) return durable.source;
+  return "process";
+}
+
+/** WinSW entry from an explicit validated candidate — never the current/npm process. */
+export function serviceRuntimeWinswEntry(runtime: ServiceRuntimeIdentity): WinswEntry {
+  return cliEntry(validateServiceRuntimeIdentity(runtime));
+}
+
+function cliEntry(runtime?: ServiceRuntimeIdentity): { bun: string; bunRuntimeSource: BunRuntimeSource; cli: string } {
+  if (runtime) {
+    const validated = validateServiceRuntimeIdentity(runtime);
+    return {
+      bun: validated.bunPath,
+      bunRuntimeSource: provenanceForRuntimePath(validated.bunPath),
+      cli: validated.cliPath,
+    };
+  }
   // Bake the bundled Bun (npm global prefix, survives `ocx update`) rather than
   // a transient system Bun, so launchd/systemd/schtasks keep resolving even if a
   // standalone Bun is later removed. The CLI entry lives at src/cli/index.ts.
   //
   // Path and provenance come from ONE resolution so the marker can never describe a
   // different binary than the one actually baked.
-  const runtime = durableBunRuntime();
-  return { bun: runtime.path, bunRuntimeSource: runtime.source, cli: join(import.meta.dir, "cli", "index.ts") };
+  const resolved = durableBunRuntime();
+  return { bun: resolved.path, bunRuntimeSource: resolved.source, cli: join(import.meta.dir, "cli", "index.ts") };
 }
 
 function plistPath(): string {
@@ -178,8 +219,15 @@ export function parseServiceInstallState(value: unknown): ServiceInstallState | 
   return state as unknown as ServiceInstallState;
 }
 
-function writeServiceInstallState(backend: ServiceBackend = "scheduler"): void {
-  const { bun, cli } = cliEntry();
+export function writeServiceInstallStateForRuntime(
+  runtime: ServiceRuntimeIdentity,
+  backend: ServiceBackend = "scheduler",
+): void {
+  writeServiceInstallState(backend, validateServiceRuntimeIdentity(runtime));
+}
+
+function writeServiceInstallState(backend: ServiceBackend = "scheduler", runtime?: ServiceRuntimeIdentity): void {
+  const { bun, cli } = cliEntry(runtime);
   const state: ServiceInstallState = {
     version: 2,
     codexHome: currentCodexHome(),
@@ -429,8 +477,11 @@ function writeServiceApiTokenFile(): string | null {
   return path;
 }
 
-export function buildPlist(proxyEnv: { name: string; value: string }[] = resolvedProxyEnv()): string {
-  const { bun, bunRuntimeSource, cli } = cliEntry();
+export function buildPlist(
+  proxyEnv: { name: string; value: string }[] = resolvedProxyEnv(),
+  runtime?: ServiceRuntimeIdentity,
+): string {
+  const { bun, bunRuntimeSource, cli } = cliEntry(runtime);
   const log = logPath();
   const path = process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin";
   const codexHome = process.env.CODEX_HOME?.trim();
@@ -1908,7 +1959,7 @@ export function readWindowsSchedulerXmlState(
 }
 
 // ── macOS (launchd) ──
-function installLaunchd(): void {
+function installLaunchd(runtime?: ServiceRuntimeIdentity): void {
   const dir = join(homedir(), "Library", "LaunchAgents");
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   recordOwnedConfigPath(getConfigDir(), serviceStatePath());
@@ -1918,7 +1969,7 @@ function installLaunchd(): void {
   // Capture this BEFORE writing: the write below makes the plist exist unconditionally,
   // so a post-write existsSync would call every fresh install an "installed" service.
   const wasInstalled = existsSync(p);
-  writeServiceDefinitionFile(p, buildPlist(), "utf8");
+  writeServiceDefinitionFile(p, buildPlist(resolvedProxyEnv(), runtime), "utf8");
   // Best-effort: an absent job is fine here, and a failed unload is caught by the
   // load verification below with a better message than a raw unload error.
   runLaunchctl(["unload", p]);
@@ -1935,7 +1986,7 @@ function installLaunchd(): void {
       + `then re-run '${wasInstalled ? "ocx service repair" : "ocx service install"}'.`,
     );
   }
-  writeServiceInstallState();
+  writeServiceInstallState("scheduler", runtime);
 }
 /**
  * Deps are named for the layer they replace, not for the process API: `launchctl`
@@ -1973,7 +2024,11 @@ export function startLaunchd(deps: {
       : "The job is not loaded. Run 'ocx service repair' to reload it."),
   );
 }
-function stopLaunchd(): void { try { sh(`launchctl unload "${plistPath()}"`); } catch { /* not loaded */ } }
+function stopLaunchd(): void {
+  if (!statusLaunchd()) return;
+  sh(`launchctl unload "${plistPath()}"`);
+  if (statusLaunchd()) throw new Error("launchd job is still loaded after stop");
+}
 function statusLaunchd(): string { try { return sh(`launchctl list | grep ${LABEL} || true`); } catch { return ""; } }
 function uninstallLaunchd(): void {
   const p = plistPath();
@@ -2049,11 +2104,11 @@ function writeServiceAssetWithRetry(path: string, content: string, encoding: "ut
  * Rewrite on-disk scheduler assets (script/VBS/XML) without re-registering the task.
  * Used by fresh install (before schtasks /create) and by repair (no elevation).
  */
-function writeWindowsSchedulerAssets(): void {
+function writeWindowsSchedulerAssets(runtime?: ServiceRuntimeIdentity): void {
   if (!existsSync(getConfigDir())) mkdirSync(getConfigDir(), { recursive: true });
   writeServiceApiTokenFile();
   const script = windowsServiceScriptPath();
-  writeServiceAssetWithRetry(script, buildWindowsServiceScript(), "utf8");
+  writeServiceAssetWithRetry(script, buildWindowsServiceScript(cliEntry(runtime)), "utf8");
   // UTF-16LE + BOM: a BOM-less UTF-8 VBS mis-decodes non-ASCII (e.g. Korean) profile
   // paths on some WSH/codepage combinations — same contract as the task XML below.
   writeServiceAssetWithRetry(windowsLauncherVbsPath(), `\uFEFF${buildWindowsLauncherVbs(script)}`, "utf16le");
@@ -2287,16 +2342,16 @@ export function removeNativeWindowsServiceForScheduler(
   }
 }
 
-function installWindows(): void {
+function installWindows(runtime?: ServiceRuntimeIdentity): void {
   recordWindowsSchedulerOwnership();
   removeNativeWindowsServiceForScheduler();
   // End a running task BEFORE rewriting the assets it is executing — cmd.exe reading the
   // script mid-rewrite runs a torn batch file, and its open handle can fail the write.
   try { stopWindows(); } catch { /* not running */ }
-  writeWindowsSchedulerAssets();
+  writeWindowsSchedulerAssets(runtime);
   schtasks(buildWindowsSchtasksCreateArgs(windowsServiceScriptPath()));
   schtasks(["/run", "/tn", TASK]);
-  writeServiceInstallState("scheduler");
+  writeServiceInstallState("scheduler", runtime);
 }
 
 export interface RepairServiceDeps {
@@ -2309,10 +2364,15 @@ export interface RepairServiceDeps {
   writeSchedulerState?: () => void;
   writeNativeState?: () => void;
   repairNative?: () => void | Promise<void>;
+  installWinsw?: (entry: WinswEntry) => void | Promise<void>;
   repairLaunchd?: () => void;
   repairSystemd?: () => void;
   /** Test seam — defaults to process.platform so Linux CI cannot hit real installSystemd. */
   platform?: NodeJS.Platform;
+  /** Bake these verified Bun/CLI paths instead of the current process entry. */
+  runtime?: ServiceRuntimeIdentity;
+  /** Restore this backend instead of trusting diagnose() after a mutation. */
+  backend?: ServiceBackend;
 }
 
 /**
@@ -2325,6 +2385,7 @@ export interface RepairServiceDeps {
 export async function repairService(deps: RepairServiceDeps = {}): Promise<void> {
   const diagnose = deps.diagnose ?? diagnoseService;
   const platform = deps.platform ?? process.platform;
+  const runtime = deps.runtime ? validateServiceRuntimeIdentity(deps.runtime) : undefined;
   const diag = diagnose();
   if (!diag.supported) {
     throw new Error(`Background service is unsupported (${diag.summary}).`);
@@ -2343,26 +2404,106 @@ export async function repairService(deps: RepairServiceDeps = {}): Promise<void>
   (deps.assertAuth ?? assertServiceAuthEnvironment)();
 
   if (platform === "win32") {
-    if (diag.backend === "native") {
-      await (deps.repairNative ?? (() => installWinswService(defaultWinswEntry(import.meta.dir))))();
-      (deps.writeNativeState ?? (() => writeServiceInstallState("native")))();
+    const selectedBackend = deps.backend ?? diag.backend;
+    if (selectedBackend === "native") {
+      await (deps.repairNative ?? (async () => {
+        const installWinsw = deps.installWinsw ?? installWinswService;
+        if (runtime) {
+          await installWinsw(serviceRuntimeWinswEntry(runtime));
+          return;
+        }
+        await installWinsw(defaultWinswEntry(import.meta.dir));
+      }))();
+      (deps.writeNativeState ?? (() => writeServiceInstallState("native", runtime)))();
       return;
     }
     try { (deps.stopScheduler ?? stopWindows)(); } catch { /* not running */ }
-    (deps.writeSchedulerAssets ?? writeWindowsSchedulerAssets)();
+    (deps.writeSchedulerAssets ?? (() => writeWindowsSchedulerAssets(runtime)))();
     (deps.startScheduler ?? startWindows)();
-    (deps.writeSchedulerState ?? (() => writeServiceInstallState("scheduler")))();
+    (deps.writeSchedulerState ?? (() => writeServiceInstallState("scheduler", runtime)))();
     return;
   }
   if (platform === "darwin") {
-    (deps.repairLaunchd ?? installLaunchd)();
+    (deps.repairLaunchd ?? (() => installLaunchd(runtime)))();
     return;
   }
   if (platform === "linux") {
-    (deps.repairSystemd ?? installSystemd)();
+    (deps.repairSystemd ?? (() => installSystemd(runtime)))();
     return;
   }
   throw new Error(`Background service repair is unsupported on ${platform}.`);
+}
+
+export async function installManagedServiceWithRuntime(
+  runtime: ServiceRuntimeIdentity,
+  deps: {
+    backend?: ServiceBackend;
+    platform?: NodeJS.Platform;
+    install?: (runtime: ServiceRuntimeIdentity) => void | Promise<void>;
+    diagnose?: () => ServiceDiagnostic;
+    managerOps?: ServiceInstallPreparationDeps["managerOps"];
+    stopTrackedProxy?: ServiceInstallPreparationDeps["stopTrackedProxy"];
+    probeWindowsScheduler?: () => WindowsSchedulerTaskProbe;
+    installFreshWindowsScheduler?: (deps?: FreshWindowsSchedulerInstallDeps) => Promise<void>;
+    installWinsw?: (entry: WinswEntry) => void | Promise<void>;
+  } = {},
+): Promise<void> {
+  const validated = validateServiceRuntimeIdentity(runtime);
+  const backend = deps.backend ?? "scheduler";
+  const platform = deps.platform ?? process.platform;
+  if (backend === "native" && platform !== "win32") {
+    throw new Error("native Windows service backend is unavailable on this platform");
+  }
+  const prepareDeps: ServiceInstallPreparationDeps = {
+    ...(deps.diagnose ? { diagnose: deps.diagnose } : {}),
+    ...(deps.platform ? { platform: deps.platform } : {}),
+    ...(deps.managerOps ? { managerOps: deps.managerOps } : {}),
+    ...(deps.stopTrackedProxy ? { stopTrackedProxy: deps.stopTrackedProxy } : {}),
+  };
+
+  if (platform === "win32" && backend === "scheduler" && !deps.install) {
+    const probe = deps.probeWindowsScheduler ?? probeWindowsSchedulerTask;
+    const scheduler = probe();
+    if (scheduler.status === "unknown") {
+      throw new Error(`Task Scheduler state could not be verified before install: ${scheduler.detail}`);
+    }
+    if (scheduler.status === "absent") {
+      const installFresh = deps.installFreshWindowsScheduler ?? installFreshWindowsSchedulerSafely;
+      await installFresh({
+        prepare: () => prepareServiceInstall("scheduler", prepareDeps),
+        publishAssets: () => writeWindowsSchedulerAssets(validated),
+        writeState: () => writeServiceInstallState("scheduler", validated),
+      });
+      return;
+    }
+  }
+
+  await installServiceSafely(backend, async () => {
+    if (deps.install) {
+      await deps.install(validated);
+      writeServiceInstallState(backend, validated);
+      return;
+    }
+    if (platform === "linux") {
+      installSystemd(validated);
+      return;
+    }
+    if (platform === "darwin") {
+      installLaunchd(validated);
+      return;
+    }
+    if (platform === "win32") {
+      if (backend === "native") {
+        const installWinsw = deps.installWinsw ?? installWinswService;
+        await installWinsw(serviceRuntimeWinswEntry(validated));
+        writeServiceInstallState("native", validated);
+      } else {
+        installWindows(validated);
+      }
+      return;
+    }
+    throw new Error(`Background service is unsupported on ${platform}.`);
+  }, prepareDeps);
 }
 
 /**
@@ -2446,7 +2587,8 @@ export function isWindowsSchedulerEndBenign(error: unknown): boolean {
 
 /**
  * End the scheduler task. "Already stopped" is success; other `/end` failures are
- * swallowed so callers can still run tracked-proxy + live-proxy cleanup.
+ * reported so lifecycle-sensitive callers can continue proxy cleanup without
+ * claiming the supervisor stopped successfully.
  *
  * Do not key a restart-window wait on `/end` failure: the #764 case is an `/end`
  * that *succeeds* while the wrapper survives and respawns. That verification lives
@@ -2457,6 +2599,7 @@ export function stopWindows(): void {
     schtasks(["/end", "/tn", TASK]);
   } catch (error) {
     if (isWindowsSchedulerEndBenign(error)) return;
+    throw error;
   }
 }
 function statusWindows(): string { try { return schtasks(["/query", "/tn", TASK]); } catch { return ""; } }
@@ -2527,8 +2670,11 @@ function unitPath(): string {
   return join(unitDir(), `${TASK}.service`);
 }
 
-export function buildUnit(proxyEnv: { name: string; value: string }[] = resolvedProxyEnv()): string {
-  const { bun, bunRuntimeSource, cli } = cliEntry();
+export function buildUnit(
+  proxyEnv: { name: string; value: string }[] = resolvedProxyEnv(),
+  runtime?: ServiceRuntimeIdentity,
+): string {
+  const { bun, bunRuntimeSource, cli } = cliEntry(runtime);
   const log = logPath();
   const path = process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin";
   const codexHome = systemdEnvironmentAssignment("CODEX_HOME", process.env.CODEX_HOME?.trim());
@@ -2544,7 +2690,9 @@ export function buildUnit(proxyEnv: { name: string; value: string }[] = resolved
     opencodexHome,
     ...proxyEnv.map(({ name, value }) => systemdEnvironmentAssignment(name, value)),
   ].filter((line): line is string => Boolean(line)).join("\n");
-  const command = `${buildServiceShellCommand(bun, cli)} >> ${shellQuote(log)} 2>&1`;
+  // /bin/sh -lc reloads /etc/profile and can restore /usr/bin:/bin; reset PATH
+  // after login init and before token cat / exec so MainPID keeps the baked PATH.
+  const command = `PATH=${shellQuote(path)}; export PATH; ${buildServiceShellCommand(bun, cli)} >> ${shellQuote(log)} 2>&1`;
   return `[Unit]
 Description=OpenCodex Proxy Server
 After=network-online.target
@@ -2595,18 +2743,18 @@ function isSystemd(): boolean {
   return userRuntimeDir() !== null;
 }
 
-function installSystemd(): void {
+function installSystemd(runtime?: ServiceRuntimeIdentity): void {
   ensureUserBusEnv(); // reach the user bus over a bare SSH session (F9)
   const dir = unitDir();
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   recordOwnedConfigPath(getConfigDir(), serviceStatePath());
   if (!existsSync(getConfigDir())) mkdirSync(getConfigDir(), { recursive: true });
   writeServiceApiTokenFile();
-  writeServiceDefinitionFile(unitPath(), buildUnit(), "utf8");
+  writeServiceDefinitionFile(unitPath(), buildUnit(resolvedProxyEnv(), runtime), "utf8");
   sh("systemctl --user daemon-reload");
   sh(`systemctl --user enable ${TASK}`);
   sh(`systemctl --user restart ${TASK}`);
-  writeServiceInstallState();
+  writeServiceInstallState("scheduler", runtime);
 }
 /**
  * Whether systemd's in-memory unit differs from the file on disk.
@@ -2652,7 +2800,7 @@ function startSystemd(): void {
   }
   sh(`systemctl --user start ${TASK}`);
 }
-function stopSystemd(): void { try { sh(`systemctl --user stop ${TASK}`); } catch { /* not running */ } }
+function stopSystemd(): void { sh(`systemctl --user stop ${TASK}`); }
 function statusSystemd(): string { try { return sh(`systemctl --user status ${TASK}`); } catch { return ""; } }
 export function uninstallSystemd(deps: {
   run?: (command: string) => string;
@@ -3020,36 +3168,72 @@ export async function installFreshWindowsSchedulerSafely(
   }
 }
 
-/**
- * If a service is installed, stop it so the process manager doesn't respawn after `ocx stop`.
- * Returns true if a service was found and stopped.
- */
-export function stopServiceIfInstalled(): boolean {
+export type ManagedServiceStopOutcome =
+  | { state: "absent"; canRespawn?: false }
+  | { state: "stopped"; canRespawn?: boolean }
+  | { state: "failed"; message: string; canRespawn?: boolean };
+
+/** Stop every installed manager and preserve the difference between absent and failed. */
+export function stopServiceForTransaction(): ManagedServiceStopOutcome {
   assertServiceEnvironmentMatchesInstall();
   if (process.platform === "darwin") {
     if (existsSync(plistPath())) {
-      try { stopLaunchd(); return true; } catch { return false; }
+      try {
+        stopLaunchd();
+        return { state: "stopped" };
+      } catch (error) {
+        return { state: "failed", message: error instanceof Error ? error.message : String(error) };
+      }
     }
   } else if (process.platform === "win32") {
-    // Query BOTH backends regardless of state: a failed switch or stale state can leave
-    // two managers installed, and either one would respawn the proxy after `ocx stop`.
-    let stopped = false;
-    try {
-      const q = schtasks(["/query", "/tn", TASK]);
-      if (q.includes(TASK)) { stopWindows(); stopped = true; }
-    } catch { /* task not found */ }
-    if (statusWinswRaw() !== "nonexistent") {
-      try { stopWinswService(); stopped = true; } catch { /* best-effort */ }
+    // Query both backends: a failed switch can leave two independent supervisors.
+    const failures: string[] = [];
+    let installed = false;
+    let schedulerInstalled = false;
+    const scheduler = probeWindowsSchedulerTask(TASK);
+    if (scheduler.status === "present") {
+      installed = true;
+      schedulerInstalled = true;
+      try { stopWindows(); } catch (error) {
+        failures.push(`Task Scheduler stop failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    } else if (scheduler.status === "unknown") {
+      failures.push(`Task Scheduler state is unknown: ${scheduler.detail}`);
     }
-    // `schtasks /end` ends the task instance but the cmd `:loop` wrapper survives and
-    // respawns its child seconds later (issue #764), resurrecting the proxy during a
-    // stop or a tray restart. Kill the launcher/wrapper processes outright.
-    killWindowsServiceWrapperProcesses();
-    if (stopped) return true;
+
+    const nativeStatus = statusWinswRaw();
+    if (nativeStatus !== "nonexistent") {
+      installed = true;
+      if (nativeStatus === "unknown") failures.push("WinSW service state is unknown");
+      else {
+        try { stopWinswService(); } catch (error) {
+          failures.push(`WinSW stop failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    }
+
+    // `/end` can leave the scheduler wrapper alive long enough to respawn its child.
+    try { killWindowsServiceWrapperProcesses(); } catch (error) {
+      failures.push(`service wrapper cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (failures.length > 0) {
+      return { state: "failed", message: failures.join("; "), canRespawn: schedulerInstalled };
+    }
+    if (installed) return { state: "stopped", canRespawn: schedulerInstalled };
   } else if (process.platform === "linux" && isSystemd() && existsSync(unitPath())) {
-    try { stopSystemd(); return true; } catch { return false; }
+    try {
+      stopSystemd();
+      return { state: "stopped" };
+    } catch (error) {
+      return { state: "failed", message: error instanceof Error ? error.message : String(error) };
+    }
   }
-  return false;
+  return { state: "absent" };
+}
+
+/** Legacy boolean facade for non-transactional rendering callers. */
+export function stopServiceIfInstalled(): boolean {
+  return stopServiceForTransaction().state === "stopped";
 }
 
 /** Delete install-state files; stale state would make `ocx update` "reinstall" a service that no longer exists. */

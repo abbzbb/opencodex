@@ -151,6 +151,16 @@ describe("turning Codex off", () => {
 });
 
 describe("turning Codex back on", () => {
+  test("enable claims Codex is current only after applied injection", () => {
+    const routeSource = readFileSync(
+      join(import.meta.dir, "../src/server/management/native-integration-routes.ts"),
+      "utf8",
+    );
+    expect(routeSource).toContain("syncAppliedCodexConfig");
+    expect(routeSource).toMatch(/if \(!syncAppliedCodexConfig\(applied\)\)/);
+    expect(routeSource).toMatch(/Codex now routes through opencodex/);
+  });
+
   test("removes the key rather than storing true", async () => {
     await put(baseConfig(), { enabled: false });
     expect(persistedCodexIntent()).toBe(false);

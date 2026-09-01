@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
   applyEol,
   buildOpenaiBaseUrlLine,
@@ -6,6 +7,7 @@ import {
   buildProviderTableBlock,
   chooseCatalogPathForInjection,
   dominantEol,
+  formatCodexInjectOutcome,
   setRootOpenaiBaseUrl,
   stripInjectedOpenaiBaseUrl,
   stripOpencodexConfig,
@@ -17,6 +19,26 @@ import {
 } from "../src/codex/subagent-defaults";
 
 describe("Codex config injection", () => {
+  test("inject outcome logs treat a skip as a warning, not a green success", () => {
+    expect(formatCodexInjectOutcome({
+      success: true,
+      status: "skipped",
+      skippedReason: "no_config",
+      message: "Codex config not found at /tmp/codex/config.toml. Is Codex installed?",
+    })).toBe("⚠️  Codex config not found at /tmp/codex/config.toml. Is Codex installed?");
+    expect(formatCodexInjectOutcome({
+      success: true,
+      message: "injected",
+    })).toBe("✅ injected");
+    expect(formatCodexInjectOutcome({
+      success: false,
+      message: "refused",
+    })).toBe("⚠️  refused");
+    const initSource = readFileSync(new URL("../src/cli/init.ts", import.meta.url), "utf8");
+    expect(initSource).toContain("formatCodexInjectOutcome(result)");
+    expect(initSource).not.toContain("result.success ?");
+  });
+
   test("omits provider-level Responses WebSocket support by default", () => {
     const block = buildProviderTableBlock(10100);
 

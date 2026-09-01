@@ -304,6 +304,12 @@ describe("ocx models richer metadata", () => {
     }
   });
 
+  test("custom-model no_config wording does not claim Codex is uninstalled", () => {
+    const source = readFileSync(join(repoRoot, "src/cli/models.ts"), "utf8");
+    expect(source).not.toContain("Codex is not installed");
+    expect(source).toContain("Codex config is absent, so its catalog was not changed.");
+  });
+
   test("models rejects unknown flags", () => {
     const { dir } = freshConfig();
     try {
