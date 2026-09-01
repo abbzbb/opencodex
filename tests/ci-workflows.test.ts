@@ -427,6 +427,7 @@ describe("GitHub Actions hardening", () => {
     const ciPaths = [
       ".gitattributes",
       ".github/workflows/ci.yml",
+      ".github/workflows/desktop-reload-generation.yml",
       ".github/workflows/enforce-pr-target.yml",
       ".github/workflows/release.yml",
       ".github/workflows/stale-needs-info.yml",
@@ -714,6 +715,136 @@ describe("GitHub Actions hardening", () => {
     expect(workflow).not.toMatch(/uses:\s+\S+@(?:v\d+|main|master)\b/);
     expect(workflow).not.toContain("macos-latest");
     expect(workflow).not.toContain("windows-latest");
+  });
+
+  test("desktop reload-generation contract is least-privilege, SHA-pinned, and rust-lib only", async () => {
+    const workflow = await readText(".github/workflows/desktop-reload-generation.yml");
+    const parsed = Bun.YAML.parse(workflow) as {
+      on?: {
+        pull_request?: { paths?: string[]; branches?: string[]; types?: string[] };
+        push?: { paths?: string[]; branches?: string[] };
+        workflow_dispatch?: unknown;
+        pull_request_target?: unknown;
+      };
+      permissions?: Record<string, string>;
+      concurrency?: { group?: string; "cancel-in-progress"?: boolean };
+      jobs?: Record<string, {
+        name?: string;
+        "runs-on"?: string;
+        "timeout-minutes"?: number;
+        permissions?: Record<string, string>;
+        strategy?: { "fail-fast"?: boolean; matrix?: { os?: string[] } };
+        steps?: Array<{
+          name?: string;
+          uses?: string;
+          with?: Record<string, unknown>;
+          if?: string;
+          shell?: string;
+          run?: string;
+        }>;
+      }>;
+    };
+
+    // setup-project-bun resolves Bun from package.json; the lock moves with it.
+    const expectedPaths = [
+      "desktop/**",
+      "package.json",
+      "bun.lock",
+      ".github/workflows/desktop-reload-generation.yml",
+      ".github/actions/setup-project-bun/action.yml",
+    ];
+    expect([...(parsed.on?.pull_request?.paths ?? [])]).toEqual(expectedPaths);
+    expect([...(parsed.on?.push?.paths ?? [])]).toEqual(expectedPaths);
+    expect([...(parsed.on?.push?.branches ?? [])].sort()).toEqual(["dev", "main", "preview"]);
+    expect(parsed.on?.pull_request?.branches).toBeUndefined();
+    expect(parsed.on?.pull_request?.types).toBeUndefined();
+    expect(Object.keys(parsed.on?.pull_request ?? {}).sort()).toEqual(["paths"]);
+    expect(Object.keys(parsed.on ?? {}).sort()).toEqual([
+      "pull_request",
+      "push",
+      "workflow_dispatch",
+    ]);
+    expect(parsed.on?.pull_request_target).toBeUndefined();
+
+    expect(parsed.permissions).toEqual({ contents: "read" });
+    expect(Object.keys(parsed.permissions ?? {})).toEqual(["contents"]);
+    expect(parsed.concurrency).toEqual({
+      group: "desktop-reload-generation-${{ github.ref }}",
+      "cancel-in-progress": true,
+    });
+
+    expect(Object.keys(parsed.jobs ?? {})).toEqual(["rust-lib-contract"]);
+    const job = parsed.jobs?.["rust-lib-contract"];
+    expect(job?.name).toBe("desktop rust lib tests (${{ matrix.os }})");
+    expect(job?.name?.toLowerCase()).not.toContain("physical");
+    expect(job?.permissions).toBeUndefined();
+    expect(job?.["runs-on"]).toBe("${{ matrix.os }}");
+    expect(job?.["timeout-minutes"]).toBe(45);
+    expect(job?.strategy?.["fail-fast"]).toBe(false);
+    expect(job?.strategy?.matrix?.os).toEqual(["ubuntu-latest", "windows-latest"]);
+
+    const steps = job?.steps ?? [];
+    expect(steps[0]?.uses).toBe("actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0");
+    expect(steps[0]?.with).toEqual({ "persist-credentials": false });
+    expect(steps[1]?.uses).toBe("./.github/actions/setup-project-bun");
+
+    const rustup = steps.find(step => step.name === "Select Rust 1.88.0");
+    expect(rustup?.shell).toBe("bash");
+    expect(hasExactShellCommand(
+      rustup?.run,
+      "rustup toolchain install 1.88.0 --profile minimal --no-self-update",
+    )).toBe(true);
+    expect(hasExactShellCommand(rustup?.run, "rustup run 1.88.0 rustc --version")).toBe(true);
+    expect(hasExactShellCommand(rustup?.run, "rustup run 1.88.0 cargo --version")).toBe(true);
+    expect(rustup?.run).not.toContain("curl");
+    expect(rustup?.run).not.toContain("sh.rustup.rs");
+    expect(rustup?.run).not.toMatch(/\bstable\b/);
+
+    const cargo = steps.find(step => step.name === "Desktop Rust lib tests (authoritative)");
+    expect(cargo?.shell).toBe("bash");
+    expect(hasExactShellCommand(
+      cargo?.run,
+      "rustup run 1.88.0 cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --lib",
+    )).toBe(true);
+
+    const bunRegression = steps.find(
+      step => step.name === "Focused reload-generation Bun regression",
+    );
+    expect(bunRegression?.shell).toBe("bash");
+    expect(hasExactShellCommand(
+      bunRegression?.run,
+      "bun test ./desktop/tests/probe-a-reload-generation.test.ts",
+    )).toBe(true);
+
+    const sentinel = steps.find(
+      step => step.name === "Source-sentinel probe (not physical WebView proof)",
+    );
+    expect(sentinel?.shell).toBe("bash");
+    expect(sentinel?.run).toContain("bun desktop/scripts/probe-a-reload-generation.ts");
+    const cargoIdx = steps.findIndex(step => step.name === cargo?.name);
+    const bunIdx = steps.findIndex(step => step.name === bunRegression?.name);
+    const sentinelIdx = steps.findIndex(step => step.name === sentinel?.name);
+    expect(cargoIdx).toBeGreaterThan(-1);
+    expect(bunIdx).toBeGreaterThan(cargoIdx);
+    expect(sentinelIdx).toBeGreaterThan(bunIdx);
+    expect(hasExactShellCommand(
+      sentinel?.run,
+      `echo "$out" | grep -F '"kind":"source-sentinel"'`,
+    )).toBe(true);
+    expect(hasExactShellCommand(
+      sentinel?.run,
+      `echo "$out" | grep -F '"physicalWebviewEvidence":false'`,
+    )).toBe(true);
+    expect(hasExactShellCommand(
+      sentinel?.run,
+      `echo "$out" | grep -F '"windowsWebView2NavigateFinished":false'`,
+    )).toBe(true);
+
+    expect(workflow).not.toContain("pull_request_target");
+    expect(workflow).not.toContain("secrets.");
+    expect(workflow).not.toMatch(/uses:\s+\S+@(?:v\d+|main|master)\b/);
+    expect(workflow.toLowerCase()).not.toContain("physical-webview");
+    expect(Object.keys(parsed.jobs ?? {}).some(name => /physical/i.test(name))).toBe(false);
   });
 
   test("service lifecycle is least-privilege, bounded, and cannot swallow health failures", async () => {

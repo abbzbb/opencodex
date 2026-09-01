@@ -52,6 +52,12 @@ pub fn should_prevent_window_close() -> bool {
     true
 }
 
+/// Open, Status, and bootstrap may resolve a bridge spec only while the app is
+/// still `Running`. `QuitInProgress` and `Exiting` must not start, attach, or show.
+pub fn phase_allows_bridge_work(phase: QuitPhase) -> bool {
+    matches!(phase, QuitPhase::Running)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +128,12 @@ mod tests {
     #[test]
     fn close_hides_rather_than_quits() {
         assert!(should_prevent_window_close());
+    }
+
+    #[test]
+    fn only_running_phase_allows_bootstrap_open_or_status() {
+        assert!(phase_allows_bridge_work(QuitPhase::Running));
+        assert!(!phase_allows_bridge_work(QuitPhase::QuitInProgress));
+        assert!(!phase_allows_bridge_work(QuitPhase::Exiting));
     }
 }

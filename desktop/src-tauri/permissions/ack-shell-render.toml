@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-ack-shell-render"
+description = "Allow the canonical local app page to acknowledge a verified diagnostic render. Not granted to remote origins."
+commands.allow = ["ack_shell_render"]

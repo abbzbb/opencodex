@@ -359,6 +359,18 @@ mod tests {
             &url,
             "http://localhost:10100"
         ));
+        for hash in [
+            "#providers",
+            "#logs/debug",
+            "#dashboard/update",
+            "#codex-set",
+        ] {
+            let hashed = Url::parse(&format!("http://localhost:10100/{hash}")).unwrap();
+            assert!(
+                navigation_matches_allowed_origin(&hashed, "http://localhost:10100"),
+                "{hash}"
+            );
+        }
         let other = Url::parse("http://localhost:10101/").unwrap();
         assert!(!navigation_matches_allowed_origin(
             &other,

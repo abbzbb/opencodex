@@ -2,5 +2,5 @@
   "identifier": "main",
   "description": "Least-privilege capability for the OpenCodex Desktop main window. Sidecar/bridge invocation is owned by Rust. Dashboard JS is not granted shell, filesystem, opener, or updater IPC.",
   "windows": ["main"],
-  "permissions": []
+  "permissions": ["allow-ack-shell-render"]
 }

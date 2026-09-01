@@ -22,3 +22,31 @@ if (state === "error") {
 if (detail) {
   detailEl.textContent = detail;
 }
+
+window.__ocxApplyAndAckShell = function ocxApplyAndAckShell(
+  titleText,
+  messageText,
+  detailText,
+  marker,
+  epoch,
+  attempt
+) {
+  if (!title || !message || !detailEl) return false;
+  if (typeof marker !== "string" || typeof attempt !== "string" || !marker || !attempt) {
+    return false;
+  }
+  title.textContent = titleText;
+  message.textContent = messageText;
+  detailEl.textContent = detailText;
+  if (
+    title.textContent !== titleText
+    || message.textContent !== messageText
+    || detailEl.textContent !== detailText
+  ) {
+    return false;
+  }
+  const invoke = window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke;
+  if (typeof invoke !== "function") return false;
+  invoke("ack_shell_render", { marker, epoch, attempt });
+  return true;
+};

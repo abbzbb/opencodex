@@ -81,8 +81,8 @@ bun scripts/test.ts --root ./desktop/tests
 
 # Tauri/Rust, once the crate is the change under test
 cargo fmt --check --manifest-path desktop/src-tauri/Cargo.toml
-cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path desktop/src-tauri/Cargo.toml
+cargo clippy --locked --manifest-path desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
+cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --lib
 
 # Target-native payload (run on the matching target host)
 bun desktop/scripts/build-runtime.ts \
@@ -90,6 +90,19 @@ bun desktop/scripts/build-runtime.ts \
   --output desktop/src-tauri/resources/runtime
 bun desktop/scripts/validate-packaging.ts --require-real \
   --target x86_64-unknown-linux-gnu
+
+# Probe A HTTP session/CSRF/renewal contract (not a physical WebView).
+# Stdlib plus desktop contract/runtime origin parent installs HOME/USERPROFILE/
+# OPENCODEX_HOME/CODEX_HOME in a child process before any src/server import.
+# An outside-root decoy home must remain byte-for-byte unchanged.
+# Local shell eval is dispatch-only; diagnostic show waits for an app-local
+# DOM ack (canonical URL + epoch + marker + attempt). Reload is generation-
+# bound ReloadingShell via ?ocx-reload=<lowercase-hyphenated-uuid> (raw query,
+# not fragment, not a percent-encoded alias). PageLoad classifies payload.url()
+# only. Non-default ports are rejected; url::Url drops explicit HTTP :80, so
+# that spelling is canonical same-origin. Navigate Ok is dispatch-only.
+# Physical WebView rendering remains OPEN.
+bun desktop/scripts/probe-a-session.ts
 
 # After building a release .deb, verify its extracted install layout without
 # installing it or launching the WebView. This executes the packaged runtime;
@@ -177,6 +190,17 @@ it uncovered as `restore_failed/owned-live-graceful-stop`. Probe C remains
 OPEN. The service-path / global-stop shared-lock race remains WATCH.
 
 Neither Linux `.deb` probe is WebView, session/CSRF, or navigation evidence.
+HTTP-level Probe A evidence is in
+[`probe-a-webview-session-navigation.md`](./probes/probe-a-webview-session-navigation.md):
+loopback dashboard session bootstrap, CSRF write, `/opencodex-session` renewal
+document, wildcard bind without a session, exact-origin hash-route URLs,
+revocable identity-bearing attachment, platform-specific canonical app-local
+allowlist, serialized status/attach transactions, and new-window deny. The live
+probe parent is stdlib plus the desktop contract/`runtime/origin` (it does not
+import `src/`); the child is spawned with isolation env, `OCX_TEST_HOME_GUARD`,
+and `OCX_REAL_HOME` pointing at an outside-root decoy whose `.opencodex` and
+`.codex` trees must stay unchanged. It does not prove a physical WebView, a
+6-minute hide/reopen, or an OAuth click.
 The post-install probe directly asserted no Codex CLI and checked the full
 `current.json` identity plus uninstall (resource tree gone and package not
 installed). `/readyz` used the proven-absent `config.toml` no-op.
@@ -188,8 +212,8 @@ Explicit gaps:
 | Clean machine without Node/Bun/npm/global `ocx` | macOS arm64/x64, Windows x64; Linux x64 `.deb` passed in Debian 13 Docker |
 | Installed App resource layout → stable runtime → `src/cli/index.ts start` → `/readyz` | macOS/Windows still open; Linux x64 `.deb` passed post-install `/readyz` without WebView |
 | Target-native module load (no host-arch stand-in) | macOS arm64/x64 and Windows x64; Linux x64 passed from the extracted `.deb` stable generation |
-| Session bootstrap, CSRF write, 6-minute hide/reopen renewal | all first-ship WebViews |
-| Exact-origin navigation + system-browser handoff | all first-ship WebViews |
+| Session bootstrap, CSRF write, 6-minute hide/reopen renewal | HTTP bootstrap/CSRF/renewal document proven in a HOME/CODEX_HOME sandbox; physical WebView and 6-minute hide/reopen still open on all first-ship WebViews |
+| Exact-origin navigation + system-browser handoff | Identity-bearing attach, app-local allowlist, transactional rollback, and new-window deny proven in Rust; physical WebView click/OAuth handoff still open on all first-ship WebViews |
 | Cold/hot start, 20× double-click, single-instance | all first-ship targets |
 | Tray quit / Cmd+Q stop+restore; dashboard Stop does not respawn | all first-ship targets |
 | `desktop-service` install/crash-restart/repair/rollback | macOS, Windows, Linux `.deb` (not AppImage) |
